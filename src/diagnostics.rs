@@ -387,7 +387,7 @@ fn pick_struct_node<'a>(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Node<'a>> {
     let target = match element_index {
-        Some(index) => *crate::ts_utils::named_children(&root).get(index)?,
+        Some(index) => *crate::ts_utils::array_value_children(&root).get(index)?,
         None => root,
     };
 
@@ -642,11 +642,7 @@ async fn validate_field_value_node<'a>(
         if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
             if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).await {
                 if value_node.kind() == "array" {
-                    let mut cursor = value_node.walk();
-                    for elem_node in value_node.children(&mut cursor) {
-                        if elem_node.kind() != "["
-                            && elem_node.kind() != "]"
-                            && elem_node.kind() != ","
+                    for elem_node in crate::ts_utils::array_value_children(&value_node) {
                         {
                             let elem_diags = Box::pin(validate_node_with_type_info(
                                 &elem_node,
@@ -1564,6 +1560,36 @@ mod tests {
             messages.iter().any(|m| m.contains("Required fields: type")),
             "{messages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn array_elements_skip_comments() {
+        let root = std::env::temp_dir().join(format!("ron-array-comments-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+            #[derive(serde::Deserialize)]
+            struct Entry { key: String }
+        "#;
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer.set_workspace_root(&root).await;
+        let info = analyzer.get_type_info("Entry").await.unwrap();
+
+        // Комментарии внутри массива — не элементы: ошибок быть не должно
+        let content = r#"[
+            // первый элемент
+            (
+                key: "a",
+            ),
+            /* второй */
+            (
+                key: "b",
+            ),
+        ]"#;
+
+        let diagnostics = validate_ron_with_analyzer(content, &info, analyzer.clone()).await;
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(diagnostics.is_empty(), "{messages:?}");
     }
 
     #[tokio::test]

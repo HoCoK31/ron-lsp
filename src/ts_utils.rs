@@ -136,6 +136,22 @@ pub fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     result
 }
 
+/// Trivia: комментарии и аннотация типа — не значения RON.
+pub fn is_trivia(kind: &str) -> bool {
+    matches!(kind, "line_comment" | "block_comment" | "type_annotation")
+}
+
+/// Value nodes of a container (array/tuple): named children without comments.
+///
+/// The RON grammar keeps comments as named nodes, so an index taken from the
+/// parsed `Vec<Value>` only lines up with the tree when trivia is filtered out.
+pub fn array_value_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| !is_trivia(child.kind()))
+        .collect()
+}
+
 /// Get all named children of a node
 pub fn named_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
     let mut results = Vec::new();
@@ -447,6 +463,20 @@ mod tests {
             assert_eq!(values.len(), 0);
             assert_eq!(fields.len(), 0);
         }
+    }
+
+    #[test]
+    fn test_array_value_children_skips_comments() {
+        let mut parser = RonParser::new();
+        let tree = parser
+            .parse("[\n    // первый\n    (key: \"a\"),\n    /* второй */\n    (key: \"b\"),\n]\n")
+            .unwrap();
+        let root = find_main_value(&tree).unwrap();
+        let values = array_value_children(&root);
+        assert_eq!(values.len(), 2, "комментарии не считаются элементами");
+        assert!(values.iter().all(|v| v.kind() == "struct"));
+        assert!(is_trivia("line_comment") && is_trivia("block_comment"));
+        assert!(!is_trivia("struct"));
     }
 
     #[test]
