@@ -29,7 +29,10 @@ impl Default for RonParser {
     }
 }
 
-/// Convert LSP Position to byte offset in content
+/// Convert LSP Position to byte offset in content.
+///
+/// LSP counts `character` in UTF-16 code units, so multi-byte text (Cyrillic
+/// comments, emoji) must not be treated as a byte index.
 pub fn position_to_byte_offset(content: &str, position: Position) -> usize {
     let mut offset = 0;
     let mut current_line = 0;
@@ -44,13 +47,31 @@ pub fn position_to_byte_offset(content: &str, position: Position) -> usize {
             current_line += 1;
             current_col = 0;
         } else {
-            current_col += 1;
+            current_col += ch.len_utf16();
         }
 
         offset += ch.len_utf8();
     }
 
     offset
+}
+
+/// Convert an LSP column (`character`, UTF-16 code units) to a byte offset in one line.
+///
+/// The result is clamped to `line.len()` and always lands on a char boundary, so
+/// `line[..result]` and `line[result..]` never panic on multi-byte text.
+pub fn line_column_to_byte_offset(line: &str, character: u32) -> usize {
+    let target = character as usize;
+    let mut utf16 = 0;
+
+    for (byte_offset, ch) in line.char_indices() {
+        if utf16 >= target {
+            return byte_offset;
+        }
+        utf16 += ch.len_utf16();
+    }
+
+    line.len()
 }
 
 /// Convert tree-sitter byte range to LSP Range
@@ -425,6 +446,49 @@ mod tests {
             let fields = struct_fields(&value);
             assert_eq!(values.len(), 0);
             assert_eq!(fields.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_position_to_byte_offset_utf16_units() {
+        let content = "// Реестр флагов
+key: 1
+";
+        // Колонки LSP — UTF-16-единицы: у кириллицы 1 единица, но 2 байта
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 0)), 0);
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 3)), 3);
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 4)), 5);
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 9)), 15);
+        assert_eq!(position_to_byte_offset(content, Position::new(1, 3)), 32);
+    }
+
+    #[test]
+    fn test_position_to_byte_offset_astral() {
+        // 𝕏 — 2 UTF-16-единицы и 4 байта
+        let content = "a𝕏b
+next
+";
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 0)), 0);
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 1)), 1);
+        // Колонка после суррогатной пары (внутри неё позиция невалидна)
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 3)), 5);
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 4)), 6);
+        assert_eq!(position_to_byte_offset(content, Position::new(1, 2)), 9);
+    }
+
+    #[test]
+    fn test_line_column_to_byte_offset_char_boundary() {
+        let line = "// Реестр флагов (ADR-0021)";
+        assert_eq!(line_column_to_byte_offset(line, 0), 0);
+        assert_eq!(line_column_to_byte_offset(line, 3), 3);
+        assert_eq!(line_column_to_byte_offset(line, 4), 5);
+        assert_eq!(line_column_to_byte_offset(line, 9), 15);
+        assert_eq!(line_column_to_byte_offset(line, 999), line.len());
+        // Любая колонка даёт границу символа — срезы не паникуют
+        for column in 0..line.chars().count() as u32 + 5 {
+            let byte = line_column_to_byte_offset(line, column);
+            let _ = &line[..byte];
+            let _ = &line[byte..];
         }
     }
 

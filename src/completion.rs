@@ -70,8 +70,8 @@ fn find_current_type_context(content: &str, position: Position) -> Option<String
     }
 
     let line = lines[position.line as usize];
-    let col = position.character as usize;
-    let before_cursor = &line[..col.min(line.len())];
+    let before_cursor =
+        &line[..crate::ts_utils::line_column_to_byte_offset(line, position.character)];
 
     // Look for pattern like "TypeName(" right before cursor
     // This handles cases like: author: User(

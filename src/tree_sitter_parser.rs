@@ -198,7 +198,7 @@ fn position_to_byte_offset(content: &str, position: Position) -> usize {
             current_line += 1;
             current_col = 0;
         } else {
-            current_col += 1;
+            current_col += ch.len_utf16();
         }
 
         offset += ch.len_utf8();

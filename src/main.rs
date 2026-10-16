@@ -973,17 +973,20 @@ impl LanguageServer for Backend {
                 {
                     if i == start_line && i == end_line {
                         // Single line selection
-                        let start_char = range.start.character as usize;
-                        let end_char = range.end.character as usize;
-                        selected_text
-                            .push_str(&line[start_char.min(line.len())..end_char.min(line.len())]);
+                        let start_byte =
+                            ts_utils::line_column_to_byte_offset(line, range.start.character);
+                        let end_byte =
+                            ts_utils::line_column_to_byte_offset(line, range.end.character);
+                        selected_text.push_str(&line[start_byte..end_byte.max(start_byte)]);
                     } else if i == start_line {
-                        let start_char = range.start.character as usize;
-                        selected_text.push_str(&line[start_char.min(line.len())..]);
+                        let start_byte =
+                            ts_utils::line_column_to_byte_offset(line, range.start.character);
+                        selected_text.push_str(&line[start_byte..]);
                         selected_text.push('\n');
                     } else if i == end_line {
-                        let end_char = range.end.character as usize;
-                        selected_text.push_str(&line[..end_char.min(line.len())]);
+                        let end_byte =
+                            ts_utils::line_column_to_byte_offset(line, range.end.character);
+                        selected_text.push_str(&line[..end_byte]);
                     } else {
                         selected_text.push_str(line);
                         selected_text.push('\n');
@@ -1085,24 +1088,27 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
     }
 
     let line = lines[position.line as usize];
-    let col = position.character as usize;
-
-    if col > line.len() {
-        return None;
-    }
+    // LSP counts `character` in UTF-16 code units: convert to a byte offset that
+    // always lands on a char boundary (a raw cast panics on Cyrillic text).
+    let byte_col = ts_utils::line_column_to_byte_offset(line, position.character);
 
     // Check if we're currently on a non-word character
     // If so, look backward to find a word
-    let actual_col = if col > 0 && col <= line.len() {
-        let ch = line.chars().nth(col.saturating_sub(1));
-        if matches!(ch, Some(c) if !c.is_alphanumeric() && c != '_') {
-            // We're on punctuation, look backward for a word
-            col.saturating_sub(1)
-        } else {
-            col
-        }
+    let on_non_word = line[byte_col..]
+        .chars()
+        .next()
+        .map(|c| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(true);
+
+    let actual_col = if on_non_word {
+        // We're on punctuation, look backward for a word
+        line[..byte_col]
+            .char_indices()
+            .next_back()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
     } else {
-        col
+        byte_col
     };
 
     // Find word boundaries around actual_col
@@ -1343,6 +1349,41 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_get_word_at_position_cyrillic() {
+        // Раньше срез по байтовому индексу паниковал на кириллице (hover/goto)
+        let content = "// Реестр флагов (ADR-0021)\n";
+        assert_eq!(
+            get_word_at_position(content, Position::new(0, 4)),
+            Some("Реестр".to_string())
+        );
+        assert_eq!(
+            get_word_at_position(content, Position::new(0, 8)),
+            Some("Реестр".to_string())
+        );
+        // Слово перед курсором
+        assert_eq!(
+            get_word_at_position(content, Position::new(0, 19)),
+            Some("ADR".to_string())
+        );
+        // Курсор на пунктуации — слово слева
+        assert_eq!(
+            get_word_at_position(content, Position::new(0, 17)),
+            Some("флагов".to_string())
+        );
+        // За концом строки
+        assert_eq!(get_word_at_position(content, Position::new(0, 999)), None);
+    }
+
+    #[test]
+    fn test_format_range_cyrillic() {
+        // Срез выделения тоже считался в байтах
+        let line = "// Реестр флагов";
+        let start = ts_utils::line_column_to_byte_offset(line, 3);
+        let end = ts_utils::line_column_to_byte_offset(line, 9);
+        assert_eq!(&line[start..end], "Реестр");
+    }
 
     #[test]
     fn test_format_ron_named_struct() {
