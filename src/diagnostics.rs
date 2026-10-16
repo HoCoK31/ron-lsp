@@ -6,6 +6,7 @@ use crate::ts_utils::ParsedEnumVariant;
 use ron::Value;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tree_sitter::Node;
 
 /// Validate RON with access to RustAnalyzer for recursive type lookups (returns portable diagnostics)
 #[cfg(feature = "cli")]
@@ -51,16 +52,38 @@ pub async fn validate_ron_with_analyzer(
 
     match &type_info.kind {
         TypeKind::Struct(fields) => {
-            diagnostics.extend(
-                validate_struct_fields(
-                    content,
-                    fields,
-                    &parsed_value,
-                    type_info.has_default,
-                    Some(&analyzer),
-                )
-                .await,
-            );
+            // The top level is either a single value or an array of values (data
+            // registries often hold arrays): validate every element, not just the root.
+            match parsed_value.as_ref() {
+                Ok(Value::Seq(items)) => {
+                    for (index, item) in items.iter().enumerate() {
+                        diagnostics.extend(
+                            validate_struct_fields(
+                                content,
+                                fields,
+                                Some(item),
+                                type_info.has_default,
+                                Some(index),
+                                Some(&analyzer),
+                            )
+                            .await,
+                        );
+                    }
+                }
+                other => {
+                    diagnostics.extend(
+                        validate_struct_fields(
+                            content,
+                            fields,
+                            other.ok(),
+                            type_info.has_default,
+                            None,
+                            Some(&analyzer),
+                        )
+                        .await,
+                    );
+                }
+            }
         }
         TypeKind::Enum(variants) => {
             diagnostics.extend(
@@ -353,26 +376,59 @@ fn lsp_diagnostics_to_portable(diagnostics: &[Diagnostic]) -> Vec<diagnostic_rep
 }
 
 /// Helper function for struct validation (async version with analyzer)
+/// Pick the node to validate: the root value itself, or the `element_index`-th
+/// element of a root array.
+///
+/// A non-struct element inside an array is reported as a type mismatch; a non-struct
+/// root outside an array stays unreported (the annotation may name an alias).
+fn pick_struct_node<'a>(
+    root: Node<'a>,
+    element_index: Option<usize>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Node<'a>> {
+    let target = match element_index {
+        Some(index) => *crate::ts_utils::named_children(&root).get(index)?,
+        None => root,
+    };
+
+    if target.kind() == "struct" {
+        return Some(target);
+    }
+
+    if element_index.is_some() {
+        diagnostics.push(Diagnostic {
+            range: crate::ts_utils::node_to_lsp_range(&target),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("Type mismatch: expected struct, got {}", target.kind()),
+            ..Default::default()
+        });
+    }
+
+    None
+}
+
 async fn validate_struct_fields(
     content: &str,
     fields: &[FieldInfo],
-    parsed_value: &Result<Value, ron::error::SpannedError>,
+    parsed_value: Option<&Value>,
     has_default: bool,
+    element_index: Option<usize>,
     analyzer: Option<&Arc<RustAnalyzer>>,
 ) -> Vec<Diagnostic> {
     use crate::ts_utils::{self, RonParser};
     let mut diagnostics = Vec::new();
 
     // The RON-parsed map is used for primitive type checking (it understands typed values).
-    let ron_map = parsed_value.as_ref().ok().and_then(extract_map_from_value);
+    let ron_map = parsed_value.and_then(extract_map_from_value);
 
     // Single tree-sitter parse: drives unknown-field detection, field value node access
     // (for custom-type validation via validate_field_value_node), position reporting,
     // and missing-field detection — no re-parsing or string extraction required.
     let mut parser = RonParser::new();
     if let Some(tree) = parser.parse(content) {
-        if let Some(main_value) = ts_utils::find_main_value(&tree) {
-            if main_value.kind() == "struct" {
+        if let Some(root_value) = ts_utils::find_main_value(&tree) {
+            if let Some(main_value) = pick_struct_node(root_value, element_index, &mut diagnostics)
+            {
                 let mut present_field_names: Vec<&str> = Vec::new();
                 let struct_field_nodes = ts_utils::struct_fields(&main_value);
 
@@ -477,7 +533,14 @@ async fn validate_struct_fields(
                     if !missing_fields.is_empty() {
                         let missing_names: Vec<String> =
                             missing_fields.iter().map(|f| f.name.clone()).collect();
-                        let (line, col_start, col_end) = find_struct_name_position(content);
+                        // Inside an array there is no struct name to point at: use the element start
+                        let (line, col_start, col_end) = match element_index {
+                            Some(_) => {
+                                let start = ts_utils::node_to_lsp_range(&main_value).start;
+                                (start.line, start.character, start.character + 1)
+                            }
+                            None => find_struct_name_position(content),
+                        };
                         diagnostics.push(Diagnostic {
                             range: Range::new(
                                 Position::new(line, col_start),
@@ -1463,6 +1526,51 @@ fn simplify_ron_error(error_msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo};
+
+    #[tokio::test]
+    async fn array_root_is_validated_per_element() {
+        let root = std::env::temp_dir().join(format!("ron-array-root-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+            #[derive(serde::Deserialize)]
+            struct Entry { key: String, count: u32 }
+        "#;
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer.set_workspace_root(&root).await;
+        let info = analyzer.get_type_info("Entry").await.unwrap();
+
+        let content = r#"[
+            (
+                key: "ok",
+                count: 1,
+            ),
+            (
+                key: 2,
+                kaz: 3,
+            ),
+        ]"#;
+
+        let diagnostics = validate_ron_with_analyzer(content, &info, analyzer.clone()).await;
+        let messages: Vec<String> = diagnostics
+            .iter()
+            .map(|d| format!("{} @line {}", d.message, d.range.start.line))
+            .collect();
+
+        assert!(
+            messages.iter().any(|m| m.contains("Unknown field 'kaz'")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.starts_with("Type mismatch")),
+            "{messages:?}"
+        );
+        // Ошибки — только во втором элементе (строки 5+): первый элемент чист
+        assert!(
+            diagnostics.iter().all(|d| d.range.start.line >= 5),
+            "{messages:?}"
+        );
+    }
 
     #[tokio::test]
     async fn custom_deserializers_do_not_require_struct_shaped_values() {
