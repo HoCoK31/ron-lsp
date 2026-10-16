@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_get_word_at_position_cyrillic() {
-        // Раньше срез по байтовому индексу паниковал на кириллице (hover/goto)
+        // Slicing by a byte index used to panic on Cyrillic text (hover/goto)
         let content = "// Реестр флагов (ADR-0021)\n";
         assert_eq!(
             get_word_at_position(content, Position::new(0, 4)),
@@ -1362,23 +1362,23 @@ mod tests {
             get_word_at_position(content, Position::new(0, 8)),
             Some("Реестр".to_string())
         );
-        // Слово перед курсором
+        // The word before the cursor
         assert_eq!(
             get_word_at_position(content, Position::new(0, 19)),
             Some("ADR".to_string())
         );
-        // Курсор на пунктуации — слово слева
+        // Cursor on punctuation: take the word to the left
         assert_eq!(
             get_word_at_position(content, Position::new(0, 17)),
             Some("флагов".to_string())
         );
-        // За концом строки
+        // Past the end of the line
         assert_eq!(get_word_at_position(content, Position::new(0, 999)), None);
     }
 
     #[test]
     fn test_format_range_cyrillic() {
-        // Срез выделения тоже считался в байтах
+        // Range selection used to be sliced in bytes too
         let line = "// Реестр флагов";
         let start = ts_utils::line_column_to_byte_offset(line, 3);
         let end = ts_utils::line_column_to_byte_offset(line, 9);

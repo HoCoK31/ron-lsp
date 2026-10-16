@@ -19,7 +19,7 @@ fn check_finds_types_with_a_relative_path() {
         "#[derive(serde::Deserialize)]\nstruct Entry { key: String }\n",
     )
     .unwrap();
-    // Тип для файла задаётся маппингом ron.toml (как и в реальных проектах)
+    // The type for a file comes from a ron.toml mapping (as in real projects)
     fs::write(
         root.join("ron.toml"),
         "[[types]]\nglob = \"**/data/*.ron\"\ntype = \"crate::Entry\"\n",

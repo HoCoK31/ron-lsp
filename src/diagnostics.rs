@@ -1539,7 +1539,7 @@ mod tests {
         analyzer.set_workspace_root(&root).await;
         let info = analyzer.get_type_info("Flag").await.unwrap();
 
-        // `type` — имя поля, под которым оно видно в RON
+        // `type` is the name the field is visible under in RON
         let valid = r#"Flag(key: "flag.x", params: [Param(name: "target", type: "self")])"#;
         let diagnostics = validate_ron_with_analyzer(valid, &info, analyzer.clone()).await;
         assert!(
@@ -1548,7 +1548,7 @@ mod tests {
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
 
-        // Rust-имя `ty` в данных — ошибка
+        // The Rust name `ty` is an error in data
         let invalid = r#"Flag(key: "flag.x", params: [Param(name: "target", ty: "self")])"#;
         let diagnostics = validate_ron_with_analyzer(invalid, &info, analyzer.clone()).await;
         let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
@@ -1575,13 +1575,13 @@ mod tests {
         analyzer.set_workspace_root(&root).await;
         let info = analyzer.get_type_info("Entry").await.unwrap();
 
-        // Комментарии внутри массива — не элементы: ошибок быть не должно
+        // Comments inside an array are not elements: no diagnostics expected
         let content = r#"[
-            // первый элемент
+            // first element
             (
                 key: "a",
             ),
-            /* второй */
+            /* second */
             (
                 key: "b",
             ),
@@ -1630,7 +1630,7 @@ mod tests {
             messages.iter().any(|m| m.starts_with("Type mismatch")),
             "{messages:?}"
         );
-        // Ошибки — только во втором элементе (строки 5+): первый элемент чист
+        // Errors belong to the second element (line 5+): the first one is clean
         assert!(
             diagnostics.iter().all(|d| d.range.start.line >= 5),
             "{messages:?}"

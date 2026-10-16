@@ -136,7 +136,7 @@ pub fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     result
 }
 
-/// Trivia: комментарии и аннотация типа — не значения RON.
+/// Trivia: comments and the type annotation are not RON values.
 pub fn is_trivia(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment" | "type_annotation")
 }
@@ -469,11 +469,11 @@ mod tests {
     fn test_array_value_children_skips_comments() {
         let mut parser = RonParser::new();
         let tree = parser
-            .parse("[\n    // первый\n    (key: \"a\"),\n    /* второй */\n    (key: \"b\"),\n]\n")
+            .parse("[\n    // first element\n    (key: \"a\"),\n    /* second */\n    (key: \"b\"),\n]\n")
             .unwrap();
         let root = find_main_value(&tree).unwrap();
         let values = array_value_children(&root);
-        assert_eq!(values.len(), 2, "комментарии не считаются элементами");
+        assert_eq!(values.len(), 2, "comments are not elements");
         assert!(values.iter().all(|v| v.kind() == "struct"));
         assert!(is_trivia("line_comment") && is_trivia("block_comment"));
         assert!(!is_trivia("struct"));
@@ -484,7 +484,7 @@ mod tests {
         let content = "// Реестр флагов
 key: 1
 ";
-        // Колонки LSP — UTF-16-единицы: у кириллицы 1 единица, но 2 байта
+        // LSP columns are UTF-16 code units: Cyrillic is 1 unit but 2 bytes
         assert_eq!(position_to_byte_offset(content, Position::new(0, 0)), 0);
         assert_eq!(position_to_byte_offset(content, Position::new(0, 3)), 3);
         assert_eq!(position_to_byte_offset(content, Position::new(0, 4)), 5);
@@ -494,13 +494,13 @@ key: 1
 
     #[test]
     fn test_position_to_byte_offset_astral() {
-        // 𝕏 — 2 UTF-16-единицы и 4 байта
+        // 𝕏 is 2 UTF-16 code units and 4 bytes
         let content = "a𝕏b
 next
 ";
         assert_eq!(position_to_byte_offset(content, Position::new(0, 0)), 0);
         assert_eq!(position_to_byte_offset(content, Position::new(0, 1)), 1);
-        // Колонка после суррогатной пары (внутри неё позиция невалидна)
+        // Column after a surrogate pair (a position inside it is not valid)
         assert_eq!(position_to_byte_offset(content, Position::new(0, 3)), 5);
         assert_eq!(position_to_byte_offset(content, Position::new(0, 4)), 6);
         assert_eq!(position_to_byte_offset(content, Position::new(1, 2)), 9);
@@ -514,7 +514,7 @@ next
         assert_eq!(line_column_to_byte_offset(line, 4), 5);
         assert_eq!(line_column_to_byte_offset(line, 9), 15);
         assert_eq!(line_column_to_byte_offset(line, 999), line.len());
-        // Любая колонка даёт границу символа — срезы не паникуют
+        // Every column lands on a char boundary, so slicing never panics
         for column in 0..line.chars().count() as u32 + 5 {
             let byte = line_column_to_byte_offset(line, column);
             let _ = &line[..byte];

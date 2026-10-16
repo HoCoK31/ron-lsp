@@ -639,7 +639,7 @@ fn type_to_string(ty: &Type) -> String {
 mod serde_attributes {
     use syn::{Attribute, Field};
 
-    /// Serde-атрибуты поля (или варианта): что влияет на имя в RON и на обязательность.
+    /// Serde attributes of a field (or variant): what shapes the RON name and optionality.
     pub struct SerdeFieldAttributes {
         pub has_default: bool,
         pub rename: Option<String>,
@@ -649,11 +649,11 @@ mod serde_attributes {
         extract_serde_attributes(&field.attrs)
     }
 
-    /// Читает `#[serde(default)]` и `#[serde(rename = "…")]`.
+    /// Reads `#[serde(default)]` and `#[serde(rename = "…")]`.
     ///
-    /// Форма `rename(serialize = "…", deserialize = "…")` не разбирается: она
-    /// встречается редко, а молчаливое игнорирование здесь безопасно (имя
-    /// остаётся Rust-именем, как было до этой правки).
+    /// The `rename(serialize = "…", deserialize = "…")` form is not parsed: it is
+    /// rare, and ignoring it is safe here (the name stays the Rust identifier, as
+    /// it was before this change).
     pub fn extract_serde_attributes(attrs: &[Attribute]) -> SerdeFieldAttributes {
         let mut field_attrs = SerdeFieldAttributes {
             has_default: false,
@@ -683,7 +683,7 @@ mod serde_attributes {
         field_attrs
     }
 
-    /// Правило `#[serde(rename_all = "…")]` у типа (контейнера), если оно задано.
+    /// The container's `#[serde(rename_all = "…")]` rule, when present.
     pub fn extract_rename_all(attrs: &[Attribute]) -> Option<String> {
         let mut rule = None;
 
@@ -703,10 +703,10 @@ mod serde_attributes {
         rule
     }
 
-    /// Имя, под которым поле или вариант видно в RON.
+    /// The name a field or variant is visible under in RON.
     ///
-    /// `r#`-префикс снимается (в RON ключевые слова Rust пишутся без него),
-    /// явный `rename` приоритетнее правила `rename_all` контейнера.
+    /// A `r#` prefix is stripped (Rust keywords are written without it in RON) and
+    /// an explicit `rename` wins over the container's `rename_all` rule.
     pub fn ron_visible_name(
         rust_name: &str,
         rename: Option<&str>,
@@ -724,8 +724,8 @@ mod serde_attributes {
         }
     }
 
-    /// Разбивает имя на слова: поддерживаются `snake_case`, `kebab-case`
-    /// и `camelCase`/`PascalCase`.
+    /// Splits a name into words, supporting `snake_case`, `kebab-case` and
+    /// `camelCase`/`PascalCase`.
     fn words(name: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut current = String::new();
@@ -765,7 +765,7 @@ mod serde_attributes {
         }
     }
 
-    /// Применяет правило serde `rename_all`; неизвестное правило оставляет имя как есть.
+    /// Applies a serde `rename_all` rule; an unknown rule keeps the name as is.
     pub fn apply_rename_rule(rule: &str, name: &str) -> String {
         let parts = words(name);
         if parts.is_empty() {
@@ -831,7 +831,7 @@ mod serde_attributes {
                 apply_rename_rule("SCREAMING-KEBAB-CASE", "someField"),
                 "SOME-FIELD"
             );
-            // Неизвестное правило — имя не трогаем
+            // Unknown rule: keep the name as is
             assert_eq!(apply_rename_rule("nonsense", "someField"), "someField");
         }
     }
