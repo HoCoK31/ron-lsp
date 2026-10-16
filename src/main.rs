@@ -1803,6 +1803,7 @@ async fn run_check(path: PathBuf) {
     let mut total_files = 0;
     let mut files_with_errors = 0;
     let mut total_errors = 0;
+    let mut files_without_type = 0;
 
     // Collect files to check
     let files_to_check: Vec<PathBuf> = if is_file {
@@ -1863,7 +1864,14 @@ async fn run_check(path: PathBuf) {
                 );
             }
         } else {
-            // No type to validate against, but the file must still be valid RON
+            // No type to validate against: say so instead of passing the file silently,
+            // then check the syntax only
+            files_without_type += 1;
+            eprintln!(
+                "{}: no type mapping, syntax checked only",
+                file_path.display()
+            );
+
             let syntax_diagnostics = diagnostics::validate_ron_syntax_portable(&content);
             if !syntax_diagnostics.is_empty() {
                 files_with_errors += 1;
@@ -1877,6 +1885,13 @@ async fn run_check(path: PathBuf) {
     }
 
     eprintln!("\nChecked {} RON files", total_files);
+
+    if files_without_type > 0 {
+        eprintln!(
+            "{} files without a type mapping (syntax checked only)",
+            files_without_type
+        );
+    }
     if total_errors > 0 {
         eprintln!(
             "{} files with errors ({} total errors)",

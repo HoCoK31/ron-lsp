@@ -2,6 +2,48 @@
 
 use std::{fs, process::Command};
 
+/// A file with no type mapping is reported, not skipped silently — but it is not an error.
+#[test]
+fn check_reports_files_without_a_type_mapping() {
+    let root = std::env::temp_dir().join(format!("ron-check-unmapped-{}", std::process::id()));
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "struct Entry { key: String }\n").unwrap();
+    fs::write(root.join("data/loose.ron"), "[(key: \"a\")]\n").unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_ron-lsp");
+    let output = Command::new(binary)
+        .arg("check")
+        .arg("data")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined.contains("no type mapping, syntax checked only"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("1 files without a type mapping"),
+        "{combined}"
+    );
+    // Valid RON, just unmapped: the run still succeeds
+    assert!(output.status.success(), "{combined}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// A file without a type annotation must still be syntax-checked.
 #[test]
 fn check_reports_syntax_errors_without_a_type() {
