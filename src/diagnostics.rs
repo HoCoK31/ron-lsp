@@ -468,16 +468,19 @@ async fn validate_struct_fields(
                             // validate_field_value_node handles all generic-wrapper cases
                             // uniformly, so there are no per-container special cases here.
                             if let Some(analyzer) = analyzer {
-                                let deep_diags = Box::pin(validate_field_value_node(
+                                let handled = Box::pin(validate_field_value_node(
                                     &value_node,
                                     content,
                                     &field_info.type_name,
                                     analyzer,
                                 ))
                                 .await;
-                                if !deep_diags.is_empty() {
+                                // The node-based checker owns this shape — including the
+                                // case where it found nothing — so the RON-value checks
+                                // below stay out of it.
+                                if let Some(deep_diags) = handled {
                                     diagnostics.extend(deep_diags);
-                                    continue; // skip primitive check for this field
+                                    continue;
                                 }
                             }
 
@@ -634,55 +637,98 @@ async fn validate_enum_variant_with_fields(
 /// This is the single place that decides how to recurse into generic wrappers
 /// (Vec<T>, Option<T>, …) and plain custom types. Both `validate_struct_fields`
 /// and `validate_node_with_type_info` delegate here so the logic isn't duplicated.
+///
+/// Returns `Some(diagnostics)` when the node-based checker owns the shape — it
+/// walked the value and found exactly what there was to find — and `None` when the
+/// shape is not its business: primitives, `Option<T>`/map wrappers, plain enums and
+/// custom types without type info stay with the RON-value checks.
+///
+/// The distinction has to be explicit. A list element has no field text of its own,
+/// so the RON-value checks read the whole list by field name and report valid enum
+/// variants as "expected StatCarrier, got ()" — a false positive that appeared
+/// whenever this function validated a `Vec<Enum>` field successfully and the caller
+/// still fell through to them.
 async fn validate_field_value_node<'a>(
     value_node: &tree_sitter::Node<'a>,
     content: &str,
     field_type: &str,
     analyzer: &Arc<RustAnalyzer>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
+) -> Option<Vec<Diagnostic>> {
+    // A type with its own Deserialize impl decides for itself what RON it accepts.
     if analyzer.has_custom_deserializer(field_type).await {
-        return diagnostics;
+        return Some(Vec::new());
     }
     let field_type_normalized = field_type.replace(" ", "");
 
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
         // Vec<CustomType> — validate every array element against the inner type
-        if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
-            if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).await {
-                if value_node.kind() == "array" {
-                    for elem_node in crate::ts_utils::array_value_children(&value_node) {
-                        {
-                            let elem_diags = Box::pin(validate_node_with_type_info(
-                                &elem_node,
-                                content,
-                                &inner_type_info,
-                                analyzer,
-                            ))
-                            .await;
-                            diagnostics.extend(elem_diags);
-                        }
-                    }
-                }
-            }
+        if is_primitive_type(&inner_type) || is_std_generic_type(&inner_type) {
+            return None;
         }
-    } else if !is_primitive_type(&field_type_normalized)
-        && !is_std_generic_type(&field_type_normalized)
-    {
-        // Plain custom struct/enum — validate the node directly
-        if let Some(nested_type_info) = analyzer.get_type_info(field_type).await {
-            let nested_diags = Box::pin(validate_node_with_type_info(
-                value_node,
+        let inner_type_info = analyzer.get_type_info(&inner_type).await?;
+        if value_node.kind() != "array" {
+            return None;
+        }
+
+        let mut diagnostics = Vec::new();
+        for elem_node in crate::ts_utils::array_value_children(value_node) {
+            if let TypeKind::Enum(variants) = &inner_type_info.kind {
+                // The variant name is the one thing an element can be judged by here.
+                match crate::ts_utils::extract_enum_variant(&elem_node, content) {
+                    Some(variant) if variants.iter().any(|known| known.name == variant.name) => {}
+                    Some(variant) => diagnostics.push(Diagnostic {
+                        range: crate::ts_utils::node_to_lsp_range(&elem_node),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "Unknown variant '{}' for enum '{}'",
+                            variant.name, inner_type_info.name
+                        ),
+                        ..Default::default()
+                    }),
+                    None => diagnostics.push(Diagnostic {
+                        range: crate::ts_utils::node_to_lsp_range(&elem_node),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "expected {}, got {}",
+                            inner_type_info.name,
+                            elem_node.kind()
+                        ),
+                        ..Default::default()
+                    }),
+                }
+                continue;
+            }
+
+            let elem_diags = Box::pin(validate_node_with_type_info(
+                &elem_node,
                 content,
-                &nested_type_info,
+                &inner_type_info,
                 analyzer,
             ))
             .await;
-            diagnostics.extend(nested_diags);
+            diagnostics.extend(elem_diags);
         }
+        return Some(diagnostics);
     }
 
-    diagnostics
+    if is_primitive_type(&field_type_normalized) || is_std_generic_type(&field_type_normalized) {
+        return None;
+    }
+
+    // Plain custom type: struct-shaped values are validated here. Enum variants are
+    // left to the RON-value checks, which read the variant from the field's text.
+    let nested_type_info = analyzer.get_type_info(field_type).await?;
+    if matches!(nested_type_info.kind, TypeKind::Enum(_)) || value_node.kind() != "struct" {
+        return None;
+    }
+    let diagnostics = Box::pin(validate_node_with_type_info(
+        value_node,
+        content,
+        &nested_type_info,
+        analyzer,
+    ))
+    .await;
+    Some(diagnostics)
 }
 
 /// Validate a tree-sitter node representing a value against a TypeInfo
@@ -722,7 +768,9 @@ async fn validate_node_with_type_info<'a>(
                                     analyzer,
                                 ))
                                 .await;
-                                diagnostics.extend(field_diags);
+                                if let Some(field_diags) = field_diags {
+                                    diagnostics.extend(field_diags);
+                                }
                             }
                         } else {
                             // Unknown field
@@ -1888,7 +1936,7 @@ mod tests {
         )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
         assert!(
-            diagnostics.len() > 0,
+            !diagnostics.is_empty(),
             "Should error on primitive when expecting struct"
         );
         assert!(
@@ -1949,7 +1997,7 @@ mod tests {
             name: "John",
         )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
-        assert!(diagnostics.len() > 0, "Should error on type mismatch");
+        assert!(!diagnostics.is_empty(), "Should error on type mismatch");
         assert!(
             diagnostics
                 .iter()
@@ -2782,5 +2830,89 @@ PostReference(Post(
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].col_start, 10);
         assert_eq!(result[0].col_end, 25);
+    }
+
+    /// Regression: a `Vec<Enum>` field must not be reported as a type mismatch.
+    ///
+    /// The node-based validation handles arrays element by element; the RON-value
+    /// fallback cannot resolve enum variants inside a list (there is no field text
+    /// for an element), so it used to emit "in Vec: expected StatCarrier, got ()".
+    #[tokio::test]
+    async fn test_vec_of_enum_field_is_not_a_mismatch() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(TypeInfo {
+                name: "StatCarrier".to_string(),
+                kind: TypeKind::Enum(vec![
+                    EnumVariant {
+                        name: "creature".to_string(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                    EnumVariant {
+                        name: "item".to_string(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                ]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+
+        let type_info = TypeInfo {
+            name: "StatDef".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "applies_to".to_string(),
+                type_name: "Vec<StatCarrier>".to_string(),
+                docs: None,
+                line: None,
+                column: None,
+                has_default: false,
+            }]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        let content = r#"StatDef(
+    applies_to: [
+        creature,
+        item,
+    ],
+)"#;
+        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics.is_empty(),
+            "valid enum variants in a Vec must pass, got: {diagnostics:#?}"
+        );
+
+        // An unknown variant is still an error, reported once.
+        let content = r#"StatDef(
+    applies_to: [
+        creature,
+        bogus,
+    ],
+)"#;
+        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "exactly one error for the bogus element, got: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("bogus"),
+            "the message should name the variant, got: {:?}",
+            diagnostics[0].message
+        );
     }
 }

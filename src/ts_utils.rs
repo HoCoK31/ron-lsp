@@ -581,4 +581,39 @@ next
             panic!("Failed to parse");
         }
     }
+
+    /// The shapes an enum element can take inside an array: a bare unit variant, a
+    /// variant with data (either syntax) and a plain tuple, which is not a variant.
+    #[test]
+    fn enum_variant_forms_in_arrays() {
+        let src = r#"[
+ creature,
+ Bogus(1),
+ (1, 2),
+ Foo(a: 1),
+]"#;
+        let mut parser = RonParser::new();
+        let tree = parser.parse(src).unwrap();
+        let root = find_main_value(&tree).unwrap();
+
+        let shapes: Vec<(String, Option<String>)> = array_value_children(&root)
+            .iter()
+            .map(|node| {
+                (
+                    node.kind().to_string(),
+                    extract_enum_variant(node, src).map(|variant| variant.name),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            shapes,
+            vec![
+                ("identifier".to_string(), Some("creature".to_string())),
+                ("struct".to_string(), Some("Bogus".to_string())),
+                ("tuple".to_string(), None),
+                ("struct".to_string(), Some("Foo".to_string())),
+            ]
+        );
+    }
 }
