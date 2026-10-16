@@ -262,13 +262,20 @@ impl RustAnalyzer {
         };
 
         let docs = extract_docs(&struct_item.attrs);
+        let rename_all = serde_attributes::extract_rename_all(&struct_item.attrs);
 
         let fields = match &struct_item.fields {
             Fields::Named(fields) => fields
                 .named
                 .iter()
                 .map(|field| {
-                    let field_name = field.ident.as_ref().unwrap().to_string();
+                    let field_attributes = serde_attributes::extract_serde_field_attributes(field);
+                    let has_default = field_attributes.has_default;
+                    let field_name = serde_attributes::ron_visible_name(
+                        &field.ident.as_ref().unwrap().to_string(),
+                        field_attributes.rename.as_deref(),
+                        rename_all.as_deref(),
+                    );
                     let type_name = type_to_string(&field.ty);
                     let field_docs = extract_docs(&field.attrs);
                     let (line, column) = field
@@ -279,9 +286,6 @@ impl RustAnalyzer {
                             (start.line, start.column)
                         })
                         .unzip();
-
-                    let field_attributes = serde_attributes::extract_serde_field_attributes(field);
-                    let has_default = field_attributes.has_default;
 
                     FieldInfo {
                         name: field_name,
@@ -346,12 +350,18 @@ impl RustAnalyzer {
         };
 
         let docs = extract_docs(&enum_item.attrs);
+        let rename_all = serde_attributes::extract_rename_all(&enum_item.attrs);
 
         let variants = enum_item
             .variants
             .iter()
             .map(|variant| {
-                let variant_name = variant.ident.to_string();
+                let variant_attributes = serde_attributes::extract_serde_attributes(&variant.attrs);
+                let variant_name = serde_attributes::ron_visible_name(
+                    &variant.ident.to_string(),
+                    variant_attributes.rename.as_deref(),
+                    rename_all.as_deref(),
+                );
                 let variant_docs = extract_docs(&variant.attrs);
                 let variant_start = variant.ident.span().start();
                 let variant_line = Some(variant_start.line);
@@ -362,7 +372,14 @@ impl RustAnalyzer {
                         .named
                         .iter()
                         .map(|field| {
-                            let field_name = field.ident.as_ref().unwrap().to_string();
+                            let field_attributes =
+                                serde_attributes::extract_serde_field_attributes(field);
+                            let has_default = field_attributes.has_default;
+                            let field_name = serde_attributes::ron_visible_name(
+                                &field.ident.as_ref().unwrap().to_string(),
+                                field_attributes.rename.as_deref(),
+                                rename_all.as_deref(),
+                            );
                             let type_name = type_to_string(&field.ty);
                             let field_docs = extract_docs(&field.attrs);
                             let (line, column) = field
@@ -373,10 +390,6 @@ impl RustAnalyzer {
                                     (start.line, start.column)
                                 })
                                 .unzip();
-
-                            let field_attributes =
-                                serde_attributes::extract_serde_field_attributes(field);
-                            let has_default = field_attributes.has_default;
 
                             FieldInfo {
                                 name: field_name,
@@ -624,19 +637,30 @@ fn type_to_string(ty: &Type) -> String {
 }
 
 mod serde_attributes {
-    use syn::Field;
+    use syn::{Attribute, Field};
 
+    /// Serde-атрибуты поля (или варианта): что влияет на имя в RON и на обязательность.
     pub struct SerdeFieldAttributes {
         pub has_default: bool,
+        pub rename: Option<String>,
     }
 
     pub fn extract_serde_field_attributes(field: &Field) -> SerdeFieldAttributes {
-        let mut field_attrs = SerdeFieldAttributes { has_default: false };
+        extract_serde_attributes(&field.attrs)
+    }
 
-        let attrs = field
-            .attrs
-            .iter()
-            .filter(|attr| attr.path().is_ident("serde"));
+    /// Читает `#[serde(default)]` и `#[serde(rename = "…")]`.
+    ///
+    /// Форма `rename(serialize = "…", deserialize = "…")` не разбирается: она
+    /// встречается редко, а молчаливое игнорирование здесь безопасно (имя
+    /// остаётся Rust-именем, как было до этой правки).
+    pub fn extract_serde_attributes(attrs: &[Attribute]) -> SerdeFieldAttributes {
+        let mut field_attrs = SerdeFieldAttributes {
+            has_default: false,
+            rename: None,
+        };
+
+        let attrs = attrs.iter().filter(|attr| attr.path().is_ident("serde"));
 
         for attr in attrs {
             let _ = attr.parse_nested_meta(|meta| {
@@ -644,11 +668,172 @@ mod serde_attributes {
                 if meta.path.is_ident("default") {
                     field_attrs.has_default = true;
                 }
+                // #[serde(rename = "type")]
+                if meta.path.is_ident("rename") {
+                    if let Ok(value) = meta.value() {
+                        if let Ok(lit) = value.parse::<syn::LitStr>() {
+                            field_attrs.rename = Some(lit.value());
+                        }
+                    }
+                }
                 Ok(())
             });
         }
 
         field_attrs
+    }
+
+    /// Правило `#[serde(rename_all = "…")]` у типа (контейнера), если оно задано.
+    pub fn extract_rename_all(attrs: &[Attribute]) -> Option<String> {
+        let mut rule = None;
+
+        for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("rename_all") {
+                    if let Ok(value) = meta.value() {
+                        if let Ok(lit) = value.parse::<syn::LitStr>() {
+                            rule = Some(lit.value());
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        rule
+    }
+
+    /// Имя, под которым поле или вариант видно в RON.
+    ///
+    /// `r#`-префикс снимается (в RON ключевые слова Rust пишутся без него),
+    /// явный `rename` приоритетнее правила `rename_all` контейнера.
+    pub fn ron_visible_name(
+        rust_name: &str,
+        rename: Option<&str>,
+        rename_all: Option<&str>,
+    ) -> String {
+        let base = rust_name.strip_prefix("r#").unwrap_or(rust_name);
+
+        if let Some(rename) = rename {
+            return rename.to_string();
+        }
+
+        match rename_all {
+            Some(rule) => apply_rename_rule(rule, base),
+            None => base.to_string(),
+        }
+    }
+
+    /// Разбивает имя на слова: поддерживаются `snake_case`, `kebab-case`
+    /// и `camelCase`/`PascalCase`.
+    fn words(name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut prev_lower = false;
+
+        for ch in name.chars() {
+            if ch == '_' || ch == '-' || ch == ' ' {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                prev_lower = false;
+                continue;
+            }
+
+            if ch.is_uppercase() && prev_lower && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+
+            prev_lower = ch.is_lowercase() || ch.is_ascii_digit();
+            current.push(ch);
+        }
+
+        if !current.is_empty() {
+            out.push(current);
+        }
+
+        out
+    }
+
+    fn capitalize(word: &str) -> String {
+        let mut chars = word.chars();
+        match chars.next() {
+            Some(first) => {
+                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Применяет правило serde `rename_all`; неизвестное правило оставляет имя как есть.
+    pub fn apply_rename_rule(rule: &str, name: &str) -> String {
+        let parts = words(name);
+        if parts.is_empty() {
+            return name.to_string();
+        }
+
+        let joined = |sep: &str, f: fn(&str) -> String| -> String {
+            parts.iter().map(|w| f(w)).collect::<Vec<_>>().join(sep)
+        };
+
+        match rule {
+            "lowercase" => parts.join("").to_lowercase(),
+            "UPPERCASE" => parts.join("").to_uppercase(),
+            "PascalCase" => parts
+                .iter()
+                .map(|w| capitalize(w))
+                .collect::<Vec<_>>()
+                .join(""),
+            "camelCase" => {
+                let mut iter = parts.iter();
+                let first = iter.next().map(|w| w.to_lowercase()).unwrap_or_default();
+                first + &iter.map(|w| capitalize(w)).collect::<String>()
+            }
+            "snake_case" => joined("_", |w| w.to_lowercase()),
+            "SCREAMING_SNAKE_CASE" => joined("_", |w| w.to_uppercase()),
+            "kebab-case" => joined("-", |w| w.to_lowercase()),
+            "SCREAMING-KEBAB-CASE" => joined("-", |w| w.to_uppercase()),
+            _ => name.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn raw_ident_loses_the_prefix() {
+            assert_eq!(ron_visible_name("r#mod", None, None), "mod");
+            assert_eq!(ron_visible_name("r#type", None, None), "type");
+        }
+
+        #[test]
+        fn explicit_rename_wins_over_rename_all() {
+            assert_eq!(
+                ron_visible_name("ty", Some("type"), Some("snake_case")),
+                "type"
+            );
+        }
+
+        #[test]
+        fn rename_all_rules_cover_the_serde_set() {
+            assert_eq!(apply_rename_rule("snake_case", "someField"), "some_field");
+            assert_eq!(apply_rename_rule("camelCase", "some_field"), "someField");
+            assert_eq!(apply_rename_rule("PascalCase", "some_field"), "SomeField");
+            assert_eq!(apply_rename_rule("kebab-case", "someField"), "some-field");
+            assert_eq!(
+                apply_rename_rule("SCREAMING_SNAKE_CASE", "someField"),
+                "SOME_FIELD"
+            );
+            assert_eq!(apply_rename_rule("UPPERCASE", "some_field"), "SOMEFIELD");
+            assert_eq!(apply_rename_rule("lowercase", "SomeField"), "somefield");
+            assert_eq!(
+                apply_rename_rule("SCREAMING-KEBAB-CASE", "someField"),
+                "SOME-FIELD"
+            );
+            // Неизвестное правило — имя не трогаем
+            assert_eq!(apply_rename_rule("nonsense", "someField"), "someField");
+        }
     }
 }
 

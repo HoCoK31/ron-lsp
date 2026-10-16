@@ -1528,6 +1528,45 @@ mod tests {
     use crate::rust_analyzer::{EnumVariant, FieldInfo};
 
     #[tokio::test]
+    async fn serde_renamed_fields_are_recognised_in_data() {
+        let root = std::env::temp_dir().join(format!("ron-serde-rename-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+            #[derive(serde::Deserialize)]
+            struct Param { name: String, #[serde(rename = "type")] ty: String }
+
+            #[derive(serde::Deserialize)]
+            struct Flag { key: String, params: Vec<Param> }
+        "#;
+        std::fs::write(root.join("src/lib.rs"), source).unwrap();
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer.set_workspace_root(&root).await;
+        let info = analyzer.get_type_info("Flag").await.unwrap();
+
+        // `type` — имя поля, под которым оно видно в RON
+        let valid = r#"Flag(key: "flag.x", params: [Param(name: "target", type: "self")])"#;
+        let diagnostics = validate_ron_with_analyzer(valid, &info, analyzer.clone()).await;
+        assert!(
+            diagnostics.is_empty(),
+            "{:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Rust-имя `ty` в данных — ошибка
+        let invalid = r#"Flag(key: "flag.x", params: [Param(name: "target", ty: "self")])"#;
+        let diagnostics = validate_ron_with_analyzer(invalid, &info, analyzer.clone()).await;
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("Unknown field 'ty'")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("Required fields: type")),
+            "{messages:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn array_root_is_validated_per_element() {
         let root = std::env::temp_dir().join(format!("ron-array-root-{}", std::process::id()));
         std::fs::create_dir_all(root.join("src")).unwrap();
