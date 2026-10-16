@@ -1751,6 +1751,11 @@ async fn run_check(path: PathBuf) {
     use std::fs;
     use walkdir::WalkDir;
 
+    // Resolve to an absolute path first: walking up from a relative path ends at an
+    // empty component, and the workspace scan then finds no types at all
+    // ("Found 0 types in workspace" for a perfectly valid project).
+    let path = path.canonicalize().unwrap_or(path);
+
     // Check if path is a file or directory
     let is_file = path.is_file();
 
