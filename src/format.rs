@@ -129,17 +129,28 @@ fn format_struct(
     if !fields.is_empty() {
         output.push('\n');
 
-        for (i, field) in fields.iter().enumerate() {
-            output.push_str(&indent_str.repeat(indent_level + 1));
-            format_field(field, content, output, indent_level + 1, indent_str);
+        // Walk children in order so comments between fields stay where they are
+        let children = ts_utils::named_children(node);
 
-            // Add comma after each field
-            if i < fields.len() - 1 {
-                output.push(',');
-            } else {
-                // Optional trailing comma on last field
-                output.push(',');
+        for child in children.iter() {
+            let kind = child.kind();
+
+            if ts_utils::is_trivia(kind) {
+                output.push_str(&indent_str.repeat(indent_level + 1));
+                format_node(child, content, output, indent_level + 1, indent_str, false);
+                output.push('\n');
+                continue;
             }
+
+            // The struct name and anything else that is not a field was handled above
+            if kind != "field" {
+                continue;
+            }
+
+            output.push_str(&indent_str.repeat(indent_level + 1));
+            format_field(child, content, output, indent_level + 1, indent_str);
+            // Comma after every field, trailing one included
+            output.push(',');
             output.push('\n');
         }
 
@@ -153,6 +164,22 @@ fn format_struct(
         }
 
         for (i, child) in values.iter().enumerate() {
+            if ts_utils::is_trivia(child.kind()) {
+                if !should_inline {
+                    output.push_str(&indent_str.repeat(indent_level + 1));
+                }
+                format_node(
+                    child,
+                    content,
+                    output,
+                    indent_level + 1,
+                    indent_str,
+                    should_inline,
+                );
+                output.push('\n');
+                continue;
+            }
+
             if !should_inline {
                 output.push_str(&indent_str.repeat(indent_level + 1));
             }
@@ -239,7 +266,10 @@ fn format_array(
                 false,
             );
 
-            output.push(',');
+            // Comments are not elements: they take no separator
+            if !ts_utils::is_trivia(element.kind()) {
+                output.push(',');
+            }
             output.push('\n');
         }
 
@@ -267,14 +297,20 @@ fn format_map(
 
     output.push('{');
 
-    // Get all map entries
-    let entries = ts_utils::children_by_kind(node, "map_entry");
+    // Walk children in order so comments between entries stay where they are
+    let entries = ts_utils::named_children(node);
 
     if !entries.is_empty() {
         output.push('\n');
 
         for entry in entries.iter() {
             output.push_str(&indent_str.repeat(indent_level + 1));
+
+            if ts_utils::is_trivia(entry.kind()) {
+                format_node(entry, content, output, indent_level + 1, indent_str, false);
+                output.push('\n');
+                continue;
+            }
 
             // Format map entry (key: value)
             let children = ts_utils::named_children(entry);
@@ -337,7 +373,10 @@ fn format_tuple(
                 false,
             );
 
-            output.push(',');
+            // Comments are not elements: they take no separator
+            if !ts_utils::is_trivia(element.kind()) {
+                output.push(',');
+            }
             output.push('\n');
         }
 
@@ -367,6 +406,36 @@ mod tests {
             assert_eq!(data.name.as_deref(), Some("aoeu"));
             assert_eq!(format_ron(&output), output);
         }
+    }
+
+    #[test]
+    fn comments_in_arrays_keep_no_comma() {
+        let input = "[\n    // first\n    (\n        key: \"a\",\n    ),\n    // second\n    (\n        key: \"b\",\n    ),\n]\n";
+        let once = format_ron(input);
+
+        assert!(once.contains("// first\n"), "{once}");
+        assert!(!once.contains("// first,"), "{once}");
+        assert!(once.contains("// second\n"), "{once}");
+        // Idempotent: a second pass changes nothing
+        assert_eq!(format_ron(&once), once);
+    }
+
+    #[test]
+    fn comments_between_fields_are_kept() {
+        let input = "(\n    key: \"a\", // trailing\n    // leading\n    params: [],\n)\n";
+        let formatted = format_ron(input);
+
+        assert!(formatted.contains("// trailing"), "{formatted}");
+        assert!(formatted.contains("// leading"), "{formatted}");
+    }
+
+    #[test]
+    fn comments_in_maps_are_kept() {
+        let input = "{\n    // entry\n    \"a\": 1,\n}\n";
+        let formatted = format_ron(input);
+
+        assert!(formatted.contains("// entry"), "{formatted}");
+        assert!(!formatted.contains("// entry,"), "{formatted}");
     }
 
     #[test]
