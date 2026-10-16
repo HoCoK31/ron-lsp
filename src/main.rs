@@ -1862,8 +1862,18 @@ async fn run_check(path: PathBuf) {
                     type_path
                 );
             }
+        } else {
+            // No type to validate against, but the file must still be valid RON
+            let syntax_diagnostics = diagnostics::validate_ron_syntax_portable(&content);
+            if !syntax_diagnostics.is_empty() {
+                files_with_errors += 1;
+                total_errors += syntax_diagnostics.len();
+
+                for diagnostic in syntax_diagnostics {
+                    diagnostic.report_ariadne(&file_path, &content);
+                }
+            }
         }
-        // Files without type annotations are skipped silently
     }
 
     eprintln!("\nChecked {} RON files", total_files);

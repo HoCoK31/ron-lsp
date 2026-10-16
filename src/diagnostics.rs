@@ -8,6 +8,15 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use tree_sitter::Node;
 
+/// Validate RON syntax only (portable diagnostics).
+///
+/// Used for files that have no type to validate against: a file still has to be
+/// valid RON, and skipping it silently hides real syntax errors.
+#[cfg(feature = "cli")]
+pub fn validate_ron_syntax_portable(content: &str) -> Vec<diagnostic_reporter::Diagnostic> {
+    lsp_diagnostics_to_portable(&validate_ron_syntax(content))
+}
+
 /// Validate RON with access to RustAnalyzer for recursive type lookups (returns portable diagnostics)
 #[cfg(feature = "cli")]
 pub async fn validate_ron_portable(
