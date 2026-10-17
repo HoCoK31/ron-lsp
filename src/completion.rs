@@ -574,21 +574,79 @@ fn unwrap_wrapper(type_name: &str) -> String {
     }
 }
 
-/// Путь имён полей от корня файла до поля под курсором.
-fn field_path_at_position(content: &str, position: Position) -> Option<Vec<String>> {
+/// Шаг пути от корня файла до места под курсором.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// Поле структуры по имени.
+    Field(String),
+    /// Элемент кортежа: у структуры-кортежа поля зовутся "0", "1", …, поэтому
+    /// позиция значения и есть имя поля.
+    Element(usize),
+}
+
+/// Является ли `ancestor` предком `node` (или самим узлом).
+fn node_is_ancestor_or_self(ancestor: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.id() == ancestor.id() {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+/// Путь шагов от корня файла до места под курсором.
+fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     use crate::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
-    let node = ts_utils::node_at_position(&tree, content, position)?;
+
+    // Курсор в редакторе стоит за последним набранным символом, поэтому позиция
+    // может попасть на пробел или запятую: тогда узел берётся по байту перед
+    // курсором, если он глубже — так `delivery: [ ],` и `(Ef|) ` находят своё поле.
+    let offset = ts_utils::position_to_byte_offset(content, position);
+    let root = tree.root_node();
+    let after = root.descendant_for_byte_range(offset, offset);
+    let before_offset = offset.saturating_sub(1);
+    let before = root.descendant_for_byte_range(before_offset, before_offset);
+    // Значение перед курсором важнее пунктуации под ним: `(Ef|` и `(Ef,|` — это
+    // одно и то же место пути, а запятая сама по себе ничего не говорит.
+    let is_value = |kind: &str| {
+        matches!(
+            kind,
+            "identifier" | "integer" | "float" | "string" | "raw_string" | "boolean" | "char"
+        )
+    };
+    let cursor = match (after, before) {
+        (Some(after), Some(before)) if is_value(before.kind()) => before,
+        (Some(after), _) => after,
+        (None, Some(before)) => before,
+        (None, None) => return None,
+    };
 
     let mut path = Vec::new();
-    let mut current = Some(node);
+    let mut current = Some(cursor);
     while let Some(node) = current {
-        if node.kind() == "field" {
-            if let Some(name) = ts_utils::field_name(&node, content) {
-                path.push(name.to_string());
+        match node.kind() {
+            "field" => {
+                if let Some(name) = ts_utils::field_name(&node, content) {
+                    path.push(Step::Field(name.to_string()));
+                }
             }
+            "tuple" => {
+                // Номер значения, внутри которого стоит курсор: правило цели
+                // `(Effect, Up)` — структура-кортеж, её поля позиционные.
+                let values = ts_utils::named_children(&node);
+                if let Some(index) = values
+                    .iter()
+                    .position(|value| node_is_ancestor_or_self(*value, cursor))
+                {
+                    path.push(Step::Element(index));
+                }
+            }
+            _ => {}
         }
         current = node.parent();
     }
@@ -597,41 +655,56 @@ fn field_path_at_position(content: &str, position: Position) -> Option<Vec<Strin
     (!path.is_empty()).then_some(path)
 }
 
-/// Подсказки для значения поля, найденного по вложенности.
+/// Тип после шага пути: поле структуры или значение структуры-кортежа.
+async fn step_type(
+    analyzer: &Arc<RustAnalyzer>,
+    current: &TypeInfo,
+    step: &Step,
+) -> Option<TypeInfo> {
+    // Значение кортежа берётся по позиции: как сканер назвал поля структуры-кортежа
+    // (`0`/`1` или иначе) — не важно.
+    let type_name = match step {
+        Step::Field(name) => current
+            .fields()?
+            .iter()
+            .find(|field| &field.name == name)?
+            .type_name
+            .clone(),
+        Step::Element(index) => current.fields()?.get(*index)?.type_name.clone(),
+    };
+    analyzer.get_type_info(&unwrap_wrapper(&type_name)).await
+}
+
+/// Подсказки для значения, найденного по пути от курсора вверх.
 ///
-/// Навигация по контекстам аннотаций не спускается внутрь `Vec<T>` и вложенных
-/// структур — а `delivery` живёт в `DamageEntry` внутри `damage: [...]`. Здесь путь
-/// берётся из дерева (имена полей от корня до курсора), каждый шаг разворачивает
-/// обёртки и берёт тип поля у текущей структуры; на месте значения предлагаются
-/// варианты перечисления.
+/// Навигация по контекстам аннотаций не спускается ни в `Vec<T>`, ни во вложенные
+/// структуры, ни в кортежи: `delivery` живёт в `DamageEntry` внутри `damage: [...]`,
+/// а правило цели — в структуре-кортеже `FlagReach`. Здесь путь берётся из дерева
+/// (имена полей и номера значений кортежей от корня до курсора), каждый шаг
+/// разворачивает обёртки и берёт тип у текущей структуры; на месте значения
+/// предлагаются варианты перечисления — и только они.
 pub async fn completions_for_field_path(
     content: &str,
     position: Position,
     top_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Option<Vec<CompletionItem>> {
-    let path = field_path_at_position(content, position)?;
-    let (field, enclosing) = path.split_last()?;
+    let path = path_at_position(content, position)?;
+    let (last, enclosing) = path.split_last()?;
 
     let mut current = analyzer.get_type_info(top_type).await?;
-    for name in enclosing {
-        let type_name = current
-            .fields()?
-            .iter()
-            .find(|candidate| &candidate.name == name)?
-            .type_name
-            .clone();
-        current = analyzer.get_type_info(&unwrap_wrapper(&type_name)).await?;
+    for step in enclosing {
+        match step_type(&analyzer, &current, step).await {
+            Some(next) => {
+                current = next;
+            }
+            None => {
+                return None;
+            }
+        }
     }
 
-    let field_type = current
-        .fields()?
-        .iter()
-        .find(|candidate| &candidate.name == field)?
-        .type_name
-        .clone();
-    let inner = analyzer.get_type_info(&unwrap_wrapper(&field_type)).await?;
-
+    let inner = step_type(&analyzer, &current, last).await?;
     let TypeKind::Enum(variants) = &inner.kind else {
         return None;
     };
@@ -830,13 +903,111 @@ mod tests {
         ),
     ],
 )";
-        let path = field_path_at_position(content, Position::new(4, 16)).expect("путь до поля");
-        assert_eq!(path, vec!["damage".to_string(), "delivery".to_string()]);
+        let path = path_at_position(content, Position::new(4, 16)).expect("путь до поля");
+        assert_eq!(
+            path,
+            vec![Step::Field("damage".into()), Step::Field("delivery".into())]
+        );
 
         let items = completions_for_field_path(content, Position::new(4, 16), "DocTest", analyzer)
             .await
             .expect("подсказки для перечисления");
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["Melee", "Ranged"]);
+    }
+
+    /// Правило цели — структура-кортеж: курсор внутри значения кортежа, и вариант
+    /// перечисления берётся по позиции этого значения.
+    #[tokio::test]
+    async fn tuple_element_offers_enum_variants() {
+        use crate::rust_analyzer::{EnumVariant, FieldInfo};
+
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let type_of = |name: &str, kind: TypeKind| TypeInfo {
+            name: name.to_string(),
+            kind,
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let variant = |name: &str| EnumVariant {
+            name: name.to_string(),
+            fields: vec![],
+            docs: None,
+            line: None,
+            column: None,
+        };
+        analyzer
+            .insert_type_for_test(type_of(
+                "EffectTest",
+                TypeKind::Struct(vec![field("flags", "Vec<FlagUse>")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "FlagUse",
+                TypeKind::Struct(vec![
+                    field("key", "String"),
+                    field("target", "Vec<FlagReach>"),
+                ]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "FlagReach",
+                TypeKind::Struct(vec![field("0", "FlagTarget"), field("1", "FlagDirection")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "FlagTarget",
+                TypeKind::Enum(vec![
+                    variant("Any"),
+                    variant("Creature"),
+                    variant("Item"),
+                    variant("Effect"),
+                ]),
+            ))
+            .await;
+
+        let content = "EffectTest(
+    flags: [
+        (
+            key: \"flag.ability_add\",
+            target: [
+                (
+                    Ef,
+                    Up,
+                ),
+            ],
+        ),
+    ],
+)";
+        let path = path_at_position(content, Position::new(6, 21)).expect("путь до правила");
+        assert_eq!(
+            path,
+            vec![
+                Step::Field("flags".into()),
+                Step::Field("target".into()),
+                Step::Element(0),
+            ]
+        );
+
+        let items =
+            completions_for_field_path(content, Position::new(6, 21), "EffectTest", analyzer)
+                .await
+                .expect("варианты цели");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["Any", "Creature", "Item", "Effect"]);
     }
 }
