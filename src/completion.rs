@@ -556,6 +556,98 @@ async fn generate_value_completions_by_type(
     completions
 }
 
+/// Разворачивает обёртки `Vec<…>`, `Option<…>`, `Box<…>` до полезного типа.
+fn unwrap_wrapper(type_name: &str) -> String {
+    let mut current = type_name.replace(' ', "");
+    loop {
+        let mut unwrapped = None;
+        for wrapper in ["Vec<", "Option<", "Box<", "Rc<", "Arc<"] {
+            if current.starts_with(wrapper) && current.ends_with('>') {
+                unwrapped = Some(current[wrapper.len()..current.len() - 1].to_string());
+                break;
+            }
+        }
+        match unwrapped {
+            Some(inner) => current = inner,
+            None => return current,
+        }
+    }
+}
+
+/// Путь имён полей от корня файла до поля под курсором.
+fn field_path_at_position(content: &str, position: Position) -> Option<Vec<String>> {
+    use crate::ts_utils::{self, RonParser};
+
+    let mut parser = RonParser::new();
+    let tree = parser.parse(content)?;
+    let node = ts_utils::node_at_position(&tree, content, position)?;
+
+    let mut path = Vec::new();
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if node.kind() == "field" {
+            if let Some(name) = ts_utils::field_name(&node, content) {
+                path.push(name.to_string());
+            }
+        }
+        current = node.parent();
+    }
+    path.reverse();
+
+    (!path.is_empty()).then_some(path)
+}
+
+/// Подсказки для значения поля, найденного по вложенности.
+///
+/// Навигация по контекстам аннотаций не спускается внутрь `Vec<T>` и вложенных
+/// структур — а `delivery` живёт в `DamageEntry` внутри `damage: [...]`. Здесь путь
+/// берётся из дерева (имена полей от корня до курсора), каждый шаг разворачивает
+/// обёртки и берёт тип поля у текущей структуры; на месте значения предлагаются
+/// варианты перечисления.
+pub async fn completions_for_field_path(
+    content: &str,
+    position: Position,
+    top_type: &str,
+    analyzer: Arc<RustAnalyzer>,
+) -> Option<Vec<CompletionItem>> {
+    let path = field_path_at_position(content, position)?;
+    let (field, enclosing) = path.split_last()?;
+
+    let mut current = analyzer.get_type_info(top_type).await?;
+    for name in enclosing {
+        let type_name = current
+            .fields()?
+            .iter()
+            .find(|candidate| &candidate.name == name)?
+            .type_name
+            .clone();
+        current = analyzer.get_type_info(&unwrap_wrapper(&type_name)).await?;
+    }
+
+    let field_type = current
+        .fields()?
+        .iter()
+        .find(|candidate| &candidate.name == field)?
+        .type_name
+        .clone();
+    let inner = analyzer.get_type_info(&unwrap_wrapper(&field_type)).await?;
+
+    let TypeKind::Enum(variants) = &inner.kind else {
+        return None;
+    };
+
+    Some(
+        variants
+            .iter()
+            .map(|variant| CompletionItem {
+                label: variant.name.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                ..Default::default()
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,8 +759,84 @@ mod tests {
 
         // Should complete with variant names
         assert!(!completions.is_empty());
+
         let variant_labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
         assert!(variant_labels.contains(&"UnitVariant".to_string()));
         assert!(variant_labels.contains(&"TupleVariant".to_string()));
+    }
+    /// Путь до поля собирается из дерева, а его тип разворачивается через `Vec`.
+    #[tokio::test]
+    async fn nested_field_offers_enum_variants() {
+        use crate::rust_analyzer::{EnumVariant, FieldInfo};
+
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let type_of = |name: &str, kind: TypeKind| TypeInfo {
+            name: name.to_string(),
+            kind,
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        analyzer
+            .insert_type_for_test(type_of(
+                "DocTest",
+                TypeKind::Struct(vec![field("damage", "Vec<DamageEntry>")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "DamageEntry",
+                TypeKind::Struct(vec![field("delivery", "Vec<Delivery>")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "Delivery",
+                TypeKind::Enum(vec![
+                    EnumVariant {
+                        name: "Melee".to_string(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                    EnumVariant {
+                        name: "Ranged".to_string(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                ]),
+            ))
+            .await;
+
+        let content = "DocTest(
+    damage: [
+        (
+            delivery: [
+                
+            ],
+        ),
+    ],
+)";
+        let path = field_path_at_position(content, Position::new(4, 16)).expect("путь до поля");
+        assert_eq!(path, vec!["damage".to_string(), "delivery".to_string()]);
+
+        let items = completions_for_field_path(content, Position::new(4, 16), "DocTest", analyzer)
+            .await
+            .expect("подсказки для перечисления");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["Melee", "Ranged"]);
     }
 }

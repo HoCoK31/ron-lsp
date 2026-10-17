@@ -896,6 +896,19 @@ impl LanguageServer for Backend {
         };
 
         if let Some(type_path) = type_path {
+            // Конкретные значения поля важнее списка типов: если путь до поля
+            // разрешился и у поля есть перечисление — предлагаем его варианты.
+            if let Some(items) = completion::completions_for_field_path(
+                &content,
+                position,
+                &type_path,
+                self.rust_analyzer.clone(),
+            )
+            .await
+            {
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+
             // Get type contexts
             let contexts = self.get_type_contexts(&uri, position, &content).await;
 
