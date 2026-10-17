@@ -43,11 +43,10 @@ pub async fn validate_ron_with_analyzer(
     // If parsing failed, return syntax error
     if let Err(e) = &parsed_value {
         let error_msg = e.to_string();
-        let (line, col) = parse_error_position(&error_msg, content);
         let simplified_msg = simplify_ron_error(&error_msg);
 
         diagnostics.push(Diagnostic {
-            range: Range::new(Position::new(line, col), Position::new(line, col + 1)),
+            range: syntax_error_range(content, &error_msg),
             severity: Some(DiagnosticSeverity::ERROR),
             message: simplified_msg,
             ..Default::default()
@@ -1647,6 +1646,67 @@ pub fn validate_ron_syntax(content: &str) -> Vec<Diagnostic> {
 }
 
 /// Parse error position from RON error message
+/// Ведущая позиция сообщения RON: `16:20: …` (строка и столбец, 1-индексные).
+fn leading_position(message: &str) -> Option<(u32, u32)> {
+    let (line, rest) = message.trim_start().split_once(':')?;
+    let (col, _) = rest.split_once(':')?;
+    let line: u32 = line.trim().parse().ok()?;
+    let col: u32 = col.trim().parse().ok()?;
+    Some((line.saturating_sub(1), col.saturating_sub(1)))
+}
+
+/// Диапазон синтаксической ошибки: точку берём у самого дерева — в нём есть узел
+/// ошибки ровно там, где сломался разбор (`duration: 6a0` — это `a0`, а не начало
+/// файла). Текст ошибки RON — запасной вариант: его формат `16:20` не всегда
+/// разбирается, и тогда диагностика вставала на `1:1`.
+fn syntax_error_range(content: &str, error_msg: &str) -> Range {
+    use crate::ts_utils::{self, RonParser};
+
+    // Сообщение RON начинается с позиции (`16:20: Expected comma`) — это и есть
+    // место ошибки; дерево же восстанавливается после сбоя и может показать
+    // следующую беду, а не первую.
+    if let Some((line, col)) = leading_position(error_msg) {
+        return Range::new(Position::new(line, col), Position::new(line, col + 1));
+    }
+
+    if let Some(tree) = RonParser::new().parse(content) {
+        let mut errors = Vec::new();
+        collect_error_nodes(&tree.root_node(), &mut errors);
+
+        // Внешние узлы-ошибки просто содержат остальные: оставляем самые вложенные
+        // и берём первый слева — он и есть место, где разбор сломался.
+        let innermost: Vec<_> = errors
+            .iter()
+            .copied()
+            .filter(|node| {
+                !errors.iter().any(|other| {
+                    other.id() != node.id()
+                        && other.start_byte() >= node.start_byte()
+                        && other.end_byte() <= node.end_byte()
+                })
+            })
+            .collect();
+
+        if let Some(node) = innermost.into_iter().min_by_key(|node| node.start_byte()) {
+            return ts_utils::node_to_lsp_range(&node);
+        }
+    }
+
+    let (line, col) = parse_error_position(error_msg, content);
+    Range::new(Position::new(line, col), Position::new(line, col + 1))
+}
+
+/// Собирает все узлы-ошибки поддерева (включая пропущенные токены).
+fn collect_error_nodes<'a>(node: &tree_sitter::Node<'a>, found: &mut Vec<tree_sitter::Node<'a>>) {
+    if node.is_error() || node.is_missing() {
+        found.push(*node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_error_nodes(&child, found);
+    }
+}
+
 fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
     // RON error messages often contain position info like "1:5" or "line 1 column 5"
 
@@ -1670,10 +1730,14 @@ fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
 
     // Try to find "X:Y" pattern (common in parsers)
     if let Some(colon_pos) = error_msg.find(':') {
-        let before = &error_msg[..colon_pos];
-        // Find the last number before the colon
-        if let Some(line_start) = before.rfind(|c: char| !c.is_numeric()) {
-            let line_str = &before[line_start + 1..];
+        let before = error_msg[..colon_pos].trim();
+        // Номер строки может стоять в самом начале сообщения ("16:20: Expected comma"),
+        // тогда перед ним нет ничего, что можно было бы отрезать.
+        let line_str = match before.rfind(|c: char| !c.is_numeric()) {
+            Some(index) => &before[index + 1..],
+            None => before,
+        };
+        {
             if let Ok(line) = line_str.parse::<u32>() {
                 let after = &error_msg[colon_pos + 1..];
                 if let Some(col_end) = after.find(|c: char| !c.is_numeric()) {
@@ -3252,6 +3316,37 @@ PostReference(Post(
                 .contains("expected u32, got identifier"),
             "{:?}",
             diagnostics[0].message
+        );
+    }
+
+    /// Синтаксическая ошибка встаёт на сломанный токен, а не на начало файла.
+    #[test]
+    fn syntax_error_range_points_at_the_broken_token() {
+        let content = "Doc(
+    duration: 6a0,
+    stacks: 3,
+)";
+        let range = syntax_error_range(content, "Expected comma at 2:20");
+        assert_eq!(
+            range.start.line, 1,
+            "строка с `6a0`, а не первая: {range:?}"
+        );
+
+        let line = content.lines().nth(1).unwrap();
+        let token = u32::try_from(line.find("6a0").unwrap()).unwrap();
+        assert!(
+            range.start.character >= token && range.end.character <= token + 3,
+            "диапазон пересекает сломанный токен: {range:?}"
+        );
+    }
+
+    /// Позиция из сообщения RON читается и когда номер строки стоит в самом начале.
+    #[test]
+    fn ron_error_position_is_parsed() {
+        assert_eq!(parse_error_position("16:20: Expected comma", ""), (15, 19));
+        assert_eq!(
+            parse_error_position("at line 4 column 7: Expected identifier", ""),
+            (3, 6)
         );
     }
 }

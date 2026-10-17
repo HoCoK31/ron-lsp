@@ -620,7 +620,7 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
         )
     };
     let cursor = match (after, before) {
-        (Some(after), Some(before)) if is_value(before.kind()) => before,
+        (_, Some(before)) if is_value(before.kind()) => before,
         (Some(after), _) => after,
         (None, Some(before)) => before,
         (None, None) => return None,
