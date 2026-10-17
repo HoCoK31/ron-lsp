@@ -456,4 +456,124 @@ mod tests {
         let containing_field = get_containing_field_context(content, position);
         assert_eq!(containing_field, Some("post_type".to_string()));
     }
+
+    #[test]
+    fn test_get_field_at_position_outside_a_field_is_none() {
+        let content = "RootItem(\n    id: 42,\n)";
+
+        // On the struct name and on the closing paren there is no field ancestor.
+        assert_eq!(get_field_at_position(content, Position::new(0, 0)), None);
+        assert_eq!(get_field_at_position(content, Position::new(2, 0)), None);
+
+        // On the value the field node is still an ancestor.
+        assert_eq!(
+            get_field_at_position(content, Position::new(1, 9)),
+            Some("id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_position_to_byte_offset_counts_utf8_bytes_and_utf16_columns() {
+        // Columns are UTF-16 code units (LSP), offsets are UTF-8 bytes.
+        let content = "a😀b";
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 0)), 0);
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 1)), 1);
+        // Column 2 sits inside the surrogate pair, which the code point walk
+        // never lands on: the walk falls through to the end of the content.
+        assert_eq!(
+            position_to_byte_offset(content, Position::new(0, 2)),
+            content.len()
+        );
+        assert_eq!(position_to_byte_offset(content, Position::new(0, 3)), 5);
+        // A column past the end also falls through.
+        assert_eq!(
+            position_to_byte_offset(content, Position::new(0, 99)),
+            content.len()
+        );
+
+        // Two-byte characters move the offset by two and the column by one.
+        assert_eq!(position_to_byte_offset("é", Position::new(0, 1)), 2);
+
+        let multiline = "ab\ncd";
+        assert_eq!(position_to_byte_offset(multiline, Position::new(1, 0)), 3);
+        assert_eq!(position_to_byte_offset(multiline, Position::new(1, 1)), 4);
+        assert_eq!(
+            position_to_byte_offset(multiline, Position::new(2, 0)),
+            multiline.len()
+        );
+    }
+
+    #[test]
+    fn test_find_all_variant_field_locations_keeps_the_containing_field() {
+        let content = r#"RootItem(
+    kind: Detailed(
+        length: 1,
+    ),
+)"#;
+
+        let locations = find_all_variant_field_locations(content);
+        let summary: Vec<(&str, &str, Option<&str>, usize)> = locations
+            .iter()
+            .map(|location| {
+                (
+                    location.variant_name.as_str(),
+                    location.containing_field_name.as_str(),
+                    location.field_at_position.as_deref(),
+                    location.line_idx,
+                )
+            })
+            .collect();
+
+        // The root struct has no containing field and is not reported.
+        assert_eq!(summary, vec![("Detailed", "kind", Some("length"), 2)]);
+    }
+
+    #[test]
+    fn test_find_all_variant_field_locations_repeats_nested_fields() {
+        let content = r#"RootItem(
+    kind: Detailed(
+        inner: Nested(
+            depth: 1,
+        ),
+    ),
+)"#;
+
+        let locations = find_all_variant_field_locations(content);
+        let summary: Vec<(&str, &str, Option<&str>, usize)> = locations
+            .iter()
+            .map(|location| {
+                (
+                    location.variant_name.as_str(),
+                    location.containing_field_name.as_str(),
+                    location.field_at_position.as_deref(),
+                    location.line_idx,
+                )
+            })
+            .collect();
+
+        // Fields of a nested struct belong to the enclosing variant too.
+        assert_eq!(
+            summary,
+            vec![
+                ("Detailed", "kind", Some("inner"), 2),
+                ("Detailed", "kind", Some("depth"), 3),
+                ("Nested", "inner", Some("depth"), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_fields_from_ron_ignores_nested_fields() {
+        let content = r#"RootItem(
+    id: 42,
+    inner: InnerItem(
+        depth: 1,
+    ),
+)"#;
+
+        let mut fields = extract_fields_from_ron(content);
+        fields.sort();
+
+        assert_eq!(fields, vec!["id".to_string(), "inner".to_string()]);
+    }
 }

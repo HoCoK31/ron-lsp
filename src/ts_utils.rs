@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_position_to_byte_offset_utf16_units() {
-        let content = "// Реестр флагов
+        let content = "// Пример строки
 key: 1
 ";
         // LSP columns are UTF-16 code units: Cyrillic is 1 unit but 2 bytes
@@ -512,7 +512,7 @@ next
 
     #[test]
     fn test_line_column_to_byte_offset_char_boundary() {
-        let line = "// Реестр флагов (ADR-0021)";
+        let line = "// Пример строки (note)";
         assert_eq!(line_column_to_byte_offset(line, 0), 0);
         assert_eq!(line_column_to_byte_offset(line, 3), 3);
         assert_eq!(line_column_to_byte_offset(line, 4), 5);
@@ -619,5 +619,133 @@ next
                 ("struct".to_string(), Some("Foo".to_string())),
             ]
         );
+    }
+
+    #[test]
+    fn test_node_to_lsp_range_of_field_on_second_line() {
+        let content = "Root(\n    a: 1,\n)\n";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+        let root = find_main_value(&tree).unwrap();
+
+        assert_eq!(
+            node_to_lsp_range(&root),
+            Range::new(Position::new(0, 0), Position::new(2, 1))
+        );
+
+        let fields = struct_fields(&root);
+        assert_eq!(fields.len(), 1);
+        // The field node spans the name, the colon and the value
+        assert_eq!(
+            node_to_lsp_range(&fields[0]),
+            Range::new(Position::new(1, 4), Position::new(1, 8))
+        );
+    }
+
+    #[test]
+    fn test_node_at_position_descends_to_the_token() {
+        let content = "Root(alpha: 1)";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+
+        let name = node_at_position(&tree, content, Position::new(0, 7)).unwrap();
+        assert_eq!(name.kind(), "identifier");
+        assert_eq!(node_text(&name, content), Some("alpha"));
+
+        let value = node_at_position(&tree, content, Position::new(0, 12)).unwrap();
+        assert_eq!(value.kind(), "integer");
+        assert_eq!(node_text(&value, content), Some("1"));
+    }
+
+    #[test]
+    fn test_find_ancestor_by_kind_starts_above_the_node() {
+        let content = "Root(alpha: 1)";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+        let root = find_main_value(&tree).unwrap();
+        let fields = struct_fields(&root);
+        let name = fields[0].child(0).unwrap();
+
+        let field = find_ancestor_by_kind(name, "field").expect("the name sits in a field");
+        assert_eq!(field.id(), fields[0].id());
+        assert_eq!(
+            find_ancestor_by_kind(name, "struct").map(|node| node.id()),
+            Some(root.id())
+        );
+        // A node is not its own ancestor
+        assert!(find_ancestor_by_kind(root, "struct").is_none());
+    }
+
+    #[test]
+    fn test_children_by_kind_sees_direct_children_only() {
+        let content = "Root(a: 1, b: 2)";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+        let root = find_main_value(&tree).unwrap();
+
+        assert_eq!(children_by_kind(&root, "field").len(), 2);
+        // Only the struct name is an identifier child; field names live inside fields
+        assert_eq!(children_by_kind(&root, "identifier").len(), 1);
+        assert!(children_by_kind(&root, "integer").is_empty());
+    }
+
+    #[test]
+    fn test_named_children_keeps_comments() {
+        let content = "[\n    // note\n    1,\n    2,\n]";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+        let root = find_main_value(&tree).unwrap();
+
+        let kinds: Vec<&str> = named_children(&root)
+            .iter()
+            .map(|node| node.kind())
+            .collect();
+        assert_eq!(kinds, ["line_comment", "integer", "integer"]);
+        // The value view drops the comment, the tree view keeps it
+        assert_eq!(array_value_children(&root).len(), 2);
+    }
+
+    #[test]
+    fn test_is_empty_structure_boundaries() {
+        let cases = [
+            ("[]", true),
+            ("{}", true),
+            ("Root(a: 1)", false),
+            ("[1]", false),
+            // A named struct is never "empty": its name is a named child
+            ("Unit()", false),
+            // So is a comment inside a container
+            ("[/* note */]", false),
+            // A bare unit is a node kind of its own, not an empty struct
+            ("()", false),
+            // Only containers can be empty, a bare identifier cannot
+            ("Root", false),
+        ];
+
+        for (content, expected) in cases {
+            let mut parser = RonParser::new();
+            let tree = parser.parse(content).unwrap();
+            let main = find_main_value(&tree).unwrap();
+            assert_eq!(
+                is_empty_structure(&main, content),
+                expected,
+                "is_empty_structure({content})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_potential_variants_skips_field_names_and_tuples() {
+        let content = "Root(Mode: Plain, pair: (One, Two))";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+
+        let names: Vec<&str> = find_potential_variants(&tree, content)
+            .iter()
+            .map(|node| node_text(node, content).unwrap())
+            .collect();
+        // The struct name and the value of a field count; a field name and the
+        // elements of a tuple do not
+        assert_eq!(names, ["Root", "Plain"]);
     }
 }

@@ -194,4 +194,105 @@ mod tests {
         assert_eq!(get_byte_offset(source, 1, 2), 8);
         assert_eq!(get_byte_offset(source, 2, 0), 12);
     }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn test_get_byte_offset_clamps_column_and_line() {
+        let source = "abc\ndefgh\nij\n";
+
+        // A column within the line is added to the line start offset
+        assert_eq!(get_byte_offset(source, 1, 3), 7);
+        // A column past the end of the line is clamped to the line length
+        assert_eq!(get_byte_offset(source, 1, 99), 9);
+        // A line past the end of the source yields the source length
+        assert_eq!(get_byte_offset(source, 99, 0), source.len());
+    }
+
+    #[test]
+    fn test_error_and_warning_constructors() {
+        let error = Diagnostic::error(2, 3, 5, "unexpected token".to_string());
+        assert_eq!((error.line, error.col_start, error.col_end), (2, 3, 5));
+        assert_eq!(error.severity, Severity::Error);
+        assert_eq!(error.message, "unexpected token");
+
+        let warning = Diagnostic::warning(7, 0, 1, "unknown field".to_string());
+        assert_eq!(
+            (warning.line, warning.col_start, warning.col_end),
+            (7, 0, 1)
+        );
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.message, "unknown field");
+    }
+
+    #[test]
+    fn test_to_lsp_maps_range_severity_and_message() {
+        use tower_lsp::lsp_types::Position;
+
+        let error = Diagnostic::error(2, 3, 5, "unexpected token".to_string()).to_lsp();
+        assert_eq!(error.range.start, Position::new(2, 3));
+        assert_eq!(error.range.end, Position::new(2, 5));
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(error.message, "unexpected token");
+
+        let warning = Diagnostic::warning(0, 0, 4, "unknown field".to_string()).to_lsp();
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(warning.range.start, Position::new(0, 0));
+
+        let info = Diagnostic {
+            line: 1,
+            col_start: 1,
+            col_end: 2,
+            severity: Severity::Info,
+            message: "note".to_string(),
+        }
+        .to_lsp();
+        assert_eq!(info.severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(info.range.end, Position::new(1, 2));
+    }
+
+    #[test]
+    fn test_equality_is_based_on_position_only() {
+        // Two diagnostics are equal when they start at the same line and column,
+        // regardless of their span end, severity or message.
+        let error = Diagnostic::error(3, 4, 8, "first message".to_string());
+        let warning = Diagnostic::warning(3, 4, 99, "other message".to_string());
+        assert_eq!(error, warning);
+        assert_ne!(
+            error,
+            Diagnostic::error(3, 5, 8, "first message".to_string())
+        );
+        assert_ne!(
+            error,
+            Diagnostic::error(4, 4, 8, "first message".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ordering_is_by_line_then_column() {
+        let earlier_column = Diagnostic::error(1, 2, 3, "a".to_string());
+        let later_column = Diagnostic::error(1, 5, 6, "b".to_string());
+        let later_line = Diagnostic::error(4, 0, 1, "c".to_string());
+
+        assert_eq!(earlier_column.cmp(&later_column), std::cmp::Ordering::Less);
+        assert_eq!(
+            earlier_column.partial_cmp(&later_column),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(later_line.cmp(&later_column), std::cmp::Ordering::Greater);
+        // Neither the message nor the span end affects the order
+        let same_position = Diagnostic::error(1, 2, 3, "different message".to_string());
+        assert_eq!(
+            earlier_column.cmp(&same_position),
+            std::cmp::Ordering::Equal
+        );
+
+        // The CLI sorts diagnostics by line and column before printing them
+        let mut diagnostics = [
+            later_line.clone(),
+            later_column.clone(),
+            earlier_column.clone(),
+        ];
+        diagnostics.sort();
+        assert_eq!(diagnostics, [earlier_column, later_column, later_line]);
+    }
 }

@@ -834,6 +834,24 @@ mod serde_attributes {
             // Unknown rule: keep the name as is
             assert_eq!(apply_rename_rule("nonsense", "someField"), "someField");
         }
+
+        #[test]
+        fn words_split_on_separators_and_lower_to_upper_steps() {
+            assert_eq!(words("someField"), vec!["some", "Field"]);
+            assert_eq!(words("some_field_name"), vec!["some", "field", "name"]);
+            assert_eq!(words("kebab-case-name"), vec!["kebab", "case", "name"]);
+            // Digits count as lowercase, so the next capital still splits.
+            assert_eq!(words("field2Name"), vec!["field2", "Name"]);
+            // A run of capitals is not split, so it stays a single word.
+            assert_eq!(words("HTTPServer"), vec!["HTTPServer"]);
+            assert_eq!(words(""), Vec::<String>::new());
+        }
+
+        #[test]
+        fn capitalize_keeps_the_tail_lowercase() {
+            assert_eq!(capitalize("hTTP"), "Http");
+            assert_eq!(capitalize(""), "");
+        }
     }
 }
 
@@ -910,4 +928,642 @@ fn has_serde_conversion(attrs: &[Attribute]) -> bool {
             });
             custom
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::{parse_file, parse_str, Field};
+
+    fn field(name: &str, type_name: &str) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        }
+    }
+
+    fn struct_type(name: &str, fields: Vec<FieldInfo>, has_default: bool) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            kind: TypeKind::Struct(fields),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default,
+        }
+    }
+
+    fn enum_type(name: &str, variants: Vec<EnumVariant>) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            kind: TypeKind::Enum(variants),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        }
+    }
+
+    fn variant(name: &str, fields: Vec<FieldInfo>) -> EnumVariant {
+        EnumVariant {
+            name: name.to_string(),
+            fields,
+            docs: None,
+            line: None,
+            column: None,
+        }
+    }
+
+    fn parse_struct(source: &str) -> ItemStruct {
+        parse_str(source).expect("parsable struct")
+    }
+
+    fn parse_enum(source: &str) -> ItemEnum {
+        parse_str(source).expect("parsable enum")
+    }
+
+    fn first_field(item: &ItemStruct) -> Field {
+        match &item.fields {
+            Fields::Named(fields) => fields.named.first().expect("named field").clone(),
+            _ => panic!("expected named fields"),
+        }
+    }
+
+    #[test]
+    fn is_optional_follows_the_option_prefix_and_the_default_flag() {
+        assert!(field("value", "Option<u32>").is_optional());
+        assert!(field("value", "Option").is_optional());
+        // Only the prefix is checked, so any type starting with it counts.
+        assert!(field("value", "Optional<u32>").is_optional());
+        assert!(!field("value", "u32").is_optional());
+
+        let mut with_default = field("value", "u32");
+        with_default.has_default = true;
+        assert!(with_default.is_optional());
+    }
+
+    #[test]
+    fn fields_are_available_for_structs_only() {
+        let item = struct_type(
+            "Item",
+            vec![field("id", "u32"), field("name", "String")],
+            false,
+        );
+        assert_eq!(item.fields().map(|fields| fields.len()), Some(2));
+
+        assert!(enum_type("Kind", vec![]).fields().is_none());
+    }
+
+    #[test]
+    fn find_field_looks_into_struct_and_variant_fields() {
+        let item = struct_type("Item", vec![field("id", "u32")], false);
+        assert_eq!(
+            item.find_field("id").map(|found| found.type_name.as_str()),
+            Some("u32")
+        );
+        assert!(item.find_field("missing").is_none());
+
+        let kind = enum_type(
+            "Kind",
+            vec![
+                variant("First", vec![]),
+                variant("Second", vec![field("length", "u32")]),
+            ],
+        );
+        assert_eq!(
+            kind.find_field("length")
+                .map(|found| found.type_name.as_str()),
+            Some("u32")
+        );
+        assert!(kind.find_field("id").is_none());
+    }
+
+    #[test]
+    fn find_variant_is_available_for_enums_only() {
+        let kind = enum_type("Kind", vec![variant("First", vec![])]);
+        assert_eq!(
+            kind.find_variant("First").map(|found| found.name.as_str()),
+            Some("First")
+        );
+        assert!(kind.find_variant("Second").is_none());
+
+        let item = struct_type("Item", vec![], false);
+        assert!(item.find_variant("Item").is_none());
+    }
+
+    #[test]
+    fn file_path_to_module_path_drops_src_and_module_file_names() {
+        let analyzer = RustAnalyzer::new();
+
+        assert_eq!(
+            analyzer.file_path_to_module_path(Path::new("src/models/item.rs")),
+            "crate::models::item"
+        );
+        // `lib`, `main` and `mod` name their parent module.
+        assert_eq!(
+            analyzer.file_path_to_module_path(Path::new("src/lib.rs")),
+            "crate"
+        );
+        assert_eq!(
+            analyzer.file_path_to_module_path(Path::new("src/main.rs")),
+            "crate"
+        );
+        assert_eq!(
+            analyzer.file_path_to_module_path(Path::new("src/models/mod.rs")),
+            "crate::models"
+        );
+        assert_eq!(
+            analyzer.file_path_to_module_path(Path::new("src/models/item/mod.rs")),
+            "crate::models::item"
+        );
+        // No `src` component: the file is outside the crate root.
+        assert_eq!(
+            analyzer.file_path_to_module_path(Path::new("models/item.rs")),
+            ""
+        );
+        assert_eq!(analyzer.file_path_to_module_path(Path::new("src")), "crate");
+    }
+
+    #[test]
+    fn type_to_string_keeps_the_token_spacing_of_paths() {
+        let render = |source: &str| type_to_string(&parse_str::<Type>(source).unwrap());
+
+        assert_eq!(render("u32"), "u32");
+        assert_eq!(render("Vec<Item>"), "Vec < Item >");
+        assert_eq!(render("HashMap<String, u32>"), "HashMap < String , u32 >");
+        assert_eq!(render("Option<Item>"), "Option < Item >");
+    }
+
+    #[test]
+    fn type_to_string_rebuilds_references_and_falls_back_to_tokens() {
+        let render = |source: &str| type_to_string(&parse_str::<Type>(source).unwrap());
+
+        // References are rebuilt by hand, so no spacing is added inside them.
+        assert_eq!(render("&Item"), "&Item");
+        assert_eq!(render("&mut Item"), "&mut Item");
+        assert_eq!(render("&'static str"), "&str");
+        // Every other type is printed as its token stream.
+        assert_eq!(render("[u8; 4]"), "[u8 ; 4]");
+        assert_eq!(render("(u32, u8)"), "(u32 , u8)");
+        assert_eq!(render("fn(u32) -> u32"), "fn (u32) -> u32");
+    }
+
+    #[test]
+    fn extract_docs_joins_trimmed_doc_lines() {
+        let item = parse_struct(
+            "/// First line.\n///\n/// Second line.\n#[derive(Default)]\nstruct Item;",
+        );
+        assert_eq!(
+            extract_docs(&item.attrs),
+            Some("First line.\n\nSecond line.".to_string())
+        );
+
+        // `#[doc(hidden)]` and `#[doc = include_str!(…)]` are not name/value
+        // pairs and are skipped instead of being reported as text.
+        let undocumented = parse_struct("#[doc(hidden)] struct Item;");
+        assert_eq!(extract_docs(&undocumented.attrs), None);
+    }
+
+    #[test]
+    fn has_default_derive_matches_a_whole_token_only() {
+        assert!(has_default_derive(
+            &parse_struct("#[derive(Debug, Default)] struct Item;").attrs
+        ));
+        assert!(has_default_derive(
+            &parse_struct("#[derive(Default,)] struct Item;").attrs
+        ));
+        assert!(!has_default_derive(
+            &parse_struct("#[derive(Debug, DefaultClone)] struct Item;").attrs
+        ));
+        assert!(!has_default_derive(&parse_struct("struct Item;").attrs));
+    }
+
+    #[test]
+    fn extract_serde_attributes_reads_default_and_rename() {
+        let item = parse_struct("struct Item { #[serde(default, rename = \"kind\")] value: u32 }");
+        let attrs = serde_attributes::extract_serde_field_attributes(&first_field(&item));
+        assert!(attrs.has_default);
+        assert_eq!(attrs.rename.as_deref(), Some("kind"));
+
+        let plain = parse_struct("struct Item { #[serde(other)] value: u32 }");
+        let attrs = serde_attributes::extract_serde_field_attributes(&first_field(&plain));
+        assert!(!attrs.has_default);
+        assert_eq!(attrs.rename, None);
+
+        let container = parse_struct("#[serde(default)] struct Item;");
+        let attrs = serde_attributes::extract_serde_attributes(&container.attrs);
+        assert!(attrs.has_default);
+        assert_eq!(attrs.rename, None);
+    }
+
+    #[test]
+    fn serde_values_that_nothing_parses_stop_the_attribute_walk() {
+        // The walker expects a comma after every key, so a `key = value` pair it
+        // does not parse aborts the rest of the attribute list.
+        let skipped = parse_struct(
+            "struct Item { #[serde(skip_serializing_if = \"Option::is_none\", default)] value: Option<u32> }",
+        );
+        assert!(
+            !serde_attributes::extract_serde_field_attributes(&first_field(&skipped)).has_default
+        );
+
+        let ordered = parse_struct(
+            "struct Item { #[serde(default, skip_serializing_if = \"Option::is_none\")] value: Option<u32> }",
+        );
+        assert!(
+            serde_attributes::extract_serde_field_attributes(&first_field(&ordered)).has_default
+        );
+    }
+
+    #[test]
+    fn extract_rename_all_reads_the_container_rule() {
+        let renamed = parse_struct("#[serde(rename_all = \"camelCase\")] struct Item;");
+        assert_eq!(
+            serde_attributes::extract_rename_all(&renamed.attrs).as_deref(),
+            Some("camelCase")
+        );
+
+        let plain = parse_struct("#[serde(default)] struct Item;");
+        assert_eq!(serde_attributes::extract_rename_all(&plain.attrs), None);
+    }
+
+    #[test]
+    fn has_serde_conversion_consumes_values_and_nested_options() {
+        assert!(has_serde_conversion(
+            &parse_struct("#[serde(from = \"Raw\")] struct Item;").attrs
+        ));
+        assert!(has_serde_conversion(
+            &parse_struct("#[serde(transparent)] struct Item;").attrs
+        ));
+        assert!(has_serde_conversion(
+            &parse_struct("#[serde(try_from = \"Raw\")] struct Item;").attrs
+        ));
+        // Values and parenthesised options are consumed, so the options after
+        // them are still visited (unlike the serde name/optionality parser).
+        assert!(has_serde_conversion(
+            &parse_struct("#[serde(rename_all = \"snake_case\", transparent)] struct Item;").attrs
+        ));
+        assert!(has_serde_conversion(
+            &parse_struct(
+                "#[serde(bound(deserialize = \"T: Deserialize\"), transparent)] struct Item;"
+            )
+            .attrs
+        ));
+        assert!(!has_serde_conversion(
+            &parse_struct("#[serde(rename_all = \"snake_case\")] struct Item;").attrs
+        ));
+    }
+
+    #[test]
+    fn collect_custom_deserializers_qualifies_names_and_walks_modules() {
+        let file = parse_file(
+            r#"
+#[serde(from = "Raw")]
+pub struct Converted { pub value: String }
+
+#[serde(transparent)]
+pub struct Transparent(pub String);
+
+impl<'de> Deserialize<'de> for Manual {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error> {
+        unimplemented!()
+    }
+}
+
+impl<'de> Deserialize<'de> for crate::model::Remote {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error> {
+        unimplemented!()
+    }
+}
+
+pub mod nested {
+    #[serde(try_from = "Raw")]
+    pub struct Inner { pub id: u32 }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut names = HashSet::new();
+        collect_custom_deserializers(&file.items, "", &mut names);
+
+        // An already absolute `crate::` path stays as written.
+        assert!(names.contains("crate::model::Remote"));
+        assert!(names.contains("Converted"));
+        assert!(names.contains("Transparent"));
+        assert!(names.contains("Manual"));
+        // Inline modules are walked with the module name as a prefix.
+        assert!(names.contains("nested::Inner"));
+        assert_eq!(names.len(), 5);
+
+        let mut qualified = HashSet::new();
+        collect_custom_deserializers(&file.items, "crate::model", &mut qualified);
+
+        assert!(qualified.contains("crate::model::Converted"));
+        assert!(qualified.contains("crate::model::nested::Inner"));
+        assert_eq!(qualified.len(), 5);
+    }
+
+    #[test]
+    fn extract_type_alias_records_the_full_path_and_the_target() {
+        let analyzer = RustAnalyzer::new();
+        let item: ItemType = parse_str("type ItemList = Vec<Item>;").unwrap();
+
+        let mut aliases = HashMap::new();
+        analyzer.extract_type_alias(&item, "crate::models", &mut aliases);
+        assert_eq!(
+            aliases.get("crate::models::ItemList").map(String::as_str),
+            Some("Vec < Item >")
+        );
+
+        let mut root_aliases = HashMap::new();
+        analyzer.extract_type_alias(&item, "", &mut root_aliases);
+        assert_eq!(
+            root_aliases.get("ItemList").map(String::as_str),
+            Some("Vec < Item >")
+        );
+    }
+
+    #[test]
+    fn extract_types_from_file_walks_inline_modules_and_aliases() {
+        let analyzer = RustAnalyzer::new();
+        let file = parse_file(
+            "struct Item { id: u32 }
+enum Kind { First }
+type ItemList = Vec<Item>;
+mod nested { struct Inner { id: u32 } enum Nest { A } type Alias = u8; }
+",
+        )
+        .unwrap();
+
+        let mut cache = HashMap::new();
+        let mut aliases = HashMap::new();
+        analyzer.extract_types_from_file(
+            &file,
+            Path::new("src/models.rs"),
+            &mut cache,
+            &mut aliases,
+        );
+
+        let mut names: Vec<String> = cache.keys().cloned().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "crate::models::Item",
+                "crate::models::Kind",
+                "crate::models::nested::Inner",
+                "crate::models::nested::Nest",
+            ]
+        );
+        assert_eq!(
+            cache["crate::models::Item"].source_file.as_deref(),
+            Some(Path::new("src/models.rs"))
+        );
+
+        assert_eq!(
+            aliases.get("crate::models::ItemList").map(String::as_str),
+            Some("Vec < Item >")
+        );
+        assert_eq!(
+            aliases
+                .get("crate::models::nested::Alias")
+                .map(String::as_str),
+            Some("u8")
+        );
+    }
+
+    #[test]
+    fn extract_struct_info_applies_serde_names_and_docs() {
+        let analyzer = RustAnalyzer::new();
+        let item = parse_struct(
+            "#[derive(Default)]
+#[serde(rename_all = \"snake_case\")]
+/// Docs.
+struct Item {
+    /// Field docs.
+    itemKind: u32,
+    #[serde(default)]
+    fallback: String,
+}",
+        );
+
+        let info = analyzer
+            .extract_struct_info(&item, "crate::models", Path::new("src/models.rs"))
+            .expect("struct info");
+
+        assert_eq!(info.name, "crate::models::Item");
+        assert_eq!(info.docs.as_deref(), Some("Docs."));
+        assert_eq!(
+            info.source_file.as_deref(),
+            Some(Path::new("src/models.rs"))
+        );
+        assert!(info.has_default);
+        assert_eq!((info.line, info.column), (Some(4), Some(7)));
+
+        let fields = info.fields().expect("struct fields");
+        assert_eq!(fields.len(), 2);
+
+        assert_eq!(fields[0].name, "item_kind");
+        assert_eq!(fields[0].type_name, "u32");
+        assert_eq!(fields[0].docs.as_deref(), Some("Field docs."));
+        assert_eq!((fields[0].line, fields[0].column), (Some(6), Some(4)));
+        assert!(!fields[0].has_default);
+
+        assert_eq!(fields[1].name, "fallback");
+        assert_eq!(fields[1].type_name, "String");
+        assert!(fields[1].has_default);
+    }
+
+    #[test]
+    fn extract_struct_info_numbers_unnamed_fields() {
+        let analyzer = RustAnalyzer::new();
+        let item = parse_struct("struct Pair(u32, String);");
+
+        let info = analyzer
+            .extract_struct_info(&item, "", Path::new("src/pair.rs"))
+            .expect("struct info");
+
+        assert_eq!(info.name, "Pair");
+        let fields = info.fields().expect("struct fields");
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.type_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("0", "u32"), ("1", "String")]
+        );
+        // Tuple fields carry neither docs nor a source position.
+        assert_eq!((fields[0].docs.as_deref(), fields[0].line), (None, None));
+
+        let unit = parse_struct("struct Unit;");
+        let info = analyzer
+            .extract_struct_info(&unit, "", Path::new("src/unit.rs"))
+            .expect("struct info");
+        assert!(info.fields().expect("struct fields").is_empty());
+    }
+
+    #[test]
+    fn extract_enum_info_names_variants_and_their_fields() {
+        let analyzer = RustAnalyzer::new();
+        let item = parse_enum(
+            "#[serde(rename_all = \"snake_case\")]
+enum Kind {
+    /// Unit docs.
+    Unit,
+    Named { itemKind: u32 },
+    Tuple(u8, u16),
+}",
+        );
+
+        let info = analyzer
+            .extract_enum_info(&item, "crate::models", Path::new("src/models.rs"))
+            .expect("enum info");
+
+        assert_eq!(info.name, "crate::models::Kind");
+        assert!(info.fields().is_none());
+
+        let TypeKind::Enum(variants) = &info.kind else {
+            panic!("expected an enum");
+        };
+        assert_eq!(
+            variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["unit", "named", "tuple"]
+        );
+        assert_eq!(variants[0].docs.as_deref(), Some("Unit docs."));
+        assert!(variants[0].fields.is_empty());
+
+        assert_eq!(variants[1].fields[0].name, "item_kind");
+        assert_eq!(variants[1].fields[0].type_name, "u32");
+
+        assert_eq!(
+            variants[2]
+                .fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.type_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("0", "u8"), ("1", "u16")]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_type_info_matches_exact_and_simple_names() {
+        let analyzer = RustAnalyzer::new();
+        analyzer
+            .insert_type_for_test(struct_type(
+                "crate::models::Item",
+                vec![field("id", "u32")],
+                false,
+            ))
+            .await;
+
+        for query in ["crate::models::Item", "Item", "models::Item"] {
+            assert_eq!(
+                analyzer.get_type_info(query).await.map(|info| info.name),
+                Some("crate::models::Item".to_string()),
+                "query {query}"
+            );
+        }
+
+        assert!(analyzer.get_type_info("Missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_type_info_resolves_aliases() {
+        let analyzer = RustAnalyzer::new();
+        analyzer
+            .insert_type_for_test(struct_type("crate::models::Item", vec![], false))
+            .await;
+        analyzer
+            .type_aliases
+            .write()
+            .await
+            .insert("ItemAlias".to_string(), "crate::models::Item".to_string());
+        analyzer
+            .type_aliases
+            .write()
+            .await
+            .insert("ShortAlias".to_string(), "Item".to_string());
+
+        assert_eq!(
+            analyzer
+                .get_type_info("ItemAlias")
+                .await
+                .map(|info| info.name),
+            Some("crate::models::Item".to_string())
+        );
+        assert_eq!(
+            analyzer
+                .get_type_info("ShortAlias")
+                .await
+                .map(|info| info.name),
+            Some("crate::models::Item".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_all_types_returns_the_cache_contents() {
+        let analyzer = RustAnalyzer::new();
+        assert!(analyzer.get_all_types().await.is_empty());
+
+        analyzer
+            .insert_type_for_test(struct_type("Item", vec![], false))
+            .await;
+
+        let all = analyzer.get_all_types().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "Item");
+    }
+
+    #[tokio::test]
+    async fn has_custom_deserializer_unwraps_wrappers_and_aliases() {
+        let analyzer = RustAnalyzer::new();
+        analyzer
+            .insert_type_for_test(struct_type("crate::models::Wrapper", vec![], false))
+            .await;
+        analyzer
+            .custom_deserializers
+            .write()
+            .await
+            .insert("crate::models::Wrapper".to_string());
+
+        // The cached name is reached by its simple name.
+        assert!(analyzer.has_custom_deserializer("Wrapper").await);
+        assert!(analyzer.has_custom_deserializer("Vec<Wrapper>").await);
+        assert!(
+            analyzer
+                .has_custom_deserializer("Option<Box<Wrapper>>")
+                .await
+        );
+
+        analyzer
+            .type_aliases
+            .write()
+            .await
+            .insert("WrapperAlias".to_string(), "Vec<Wrapper>".to_string());
+        assert!(analyzer.has_custom_deserializer("WrapperAlias").await);
+
+        assert!(!analyzer.has_custom_deserializer("Vec<Missing>").await);
+        // A wrapper that is not closed is not unwrapped either.
+        assert!(!analyzer.has_custom_deserializer("Vec<Wrapper").await);
+    }
+
+    #[tokio::test]
+    async fn has_custom_deserializer_stops_on_alias_cycles() {
+        let analyzer = RustAnalyzer::new();
+        {
+            let mut aliases = analyzer.type_aliases.write().await;
+            aliases.insert("First".to_string(), "Second".to_string());
+            aliases.insert("Second".to_string(), "First".to_string());
+        }
+
+        // The visited set keeps the alias chase from looping forever.
+        assert!(!analyzer.has_custom_deserializer("First").await);
+    }
 }

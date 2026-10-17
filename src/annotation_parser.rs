@@ -59,4 +59,45 @@ MyStruct(
 "#;
         assert_eq!(parse_type_annotation(content), None);
     }
+
+    #[test]
+    fn test_empty_brackets_is_none() {
+        // The capture group needs at least one character, so an empty
+        // annotation carries no type path and must not be reported as one.
+        let content = r#"/* @[] */
+
+Root(
+    id: 1,
+)
+"#;
+        assert_eq!(parse_type_annotation(content), None);
+    }
+
+    #[test]
+    fn test_first_annotation_wins() {
+        let content = r#"/* @[crate::models::Root] */
+
+/* @[crate::models::Item] */
+
+Root(
+    id: 1,
+)
+"#;
+        assert_eq!(
+            parse_type_annotation(content),
+            Some("crate::models::Root".to_string())
+        );
+    }
+
+    #[test]
+    fn test_missing_comment_terminator_is_none() {
+        // Without `*/` the annotation is not a complete comment.
+        let content = r#"/* @[crate::models::Root]
+
+Root(
+    id: 1,
+)
+"#;
+        assert_eq!(parse_type_annotation(content), None);
+    }
 }

@@ -1011,4 +1011,211 @@ mod tests {
         println!("Detected variant (should be None): {:?}", variant);
         assert!(variant.is_none());
     }
+
+    fn field_info(name: &str, type_name: &str) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        }
+    }
+
+    fn struct_type_info(name: &str, fields: Vec<FieldInfo>) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            kind: TypeKind::Struct(fields),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        }
+    }
+
+    fn action_titles(actions: &[CodeActionOrCommand]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => Some(action.title.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn single_edit(action: &CodeActionOrCommand) -> &TextEdit {
+        let CodeActionOrCommand::CodeAction(action) = action else {
+            panic!("expected a code action");
+        };
+        let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        &changes.values().next().unwrap()[0]
+    }
+
+    #[test]
+    fn test_generate_default_value_per_type() {
+        assert_eq!(generate_default_value("Option<Item>"), "None");
+        // Names arrive with the token spacing of the Rust type printer.
+        assert_eq!(generate_default_value("Option < Item >"), "None");
+        assert_eq!(generate_default_value("bool"), "false");
+        assert_eq!(generate_default_value("Vec<String>"), "[]");
+        assert_eq!(generate_default_value("[u8 ; 4]"), "[]");
+        assert_eq!(generate_default_value("HashMap<String, u32>"), "{}");
+        assert_eq!(generate_default_value("BTreeMap < String , u32 >"), "{}");
+        assert_eq!(generate_default_value("String"), "\"\"");
+        assert_eq!(generate_default_value("&str"), "\"\"");
+        assert_eq!(generate_default_value("str"), "\"\"");
+        assert_eq!(generate_default_value("i32"), "0");
+        assert_eq!(generate_default_value("u64"), "0");
+        assert_eq!(generate_default_value("f64"), "0");
+        assert_eq!(generate_default_value("Inner"), "Inner()");
+    }
+
+    #[test]
+    fn test_generate_default_value_boundaries() {
+        // The numeric branch only accepts i/u/f and digits, so `isize` and
+        // `usize` fall through to the constructor branch.
+        assert_eq!(generate_default_value("usize"), "usize()");
+        assert_eq!(generate_default_value("isize"), "isize()");
+        // An empty name passes the numeric character filter vacuously.
+        assert_eq!(generate_default_value(""), "0");
+    }
+
+    #[test]
+    fn test_generate_field_insertions_adds_comma_after_existing_fields() {
+        let content = "Item(\n    id: 1,\n)";
+        let name = field_info("name", "String");
+        let count = field_info("count", "i32");
+
+        let edit = generate_field_insertions(&[&name, &count], content).unwrap();
+
+        assert_eq!(edit.new_text, ",\n    name: \"\",\n    count: 0\n");
+        // Inserted just before the closing paren on the last line.
+        assert_eq!((edit.range.start.line, edit.range.start.character), (2, 0));
+        assert_eq!(edit.range.start, edit.range.end);
+    }
+
+    #[test]
+    fn test_generate_field_insertions_without_existing_fields() {
+        let name = field_info("name", "String");
+
+        let empty = generate_field_insertions(&[&name], "Item(\n)").unwrap();
+        assert_eq!(empty.new_text, "\n    name: \"\"\n");
+        assert_eq!(
+            (empty.range.start.line, empty.range.start.character),
+            (1, 0)
+        );
+
+        // A single-line struct keeps the field on the opening line.
+        let inline = generate_field_insertions(&[&name], "Item()").unwrap();
+        assert_eq!(inline.new_text, "    name: \"\"\n");
+        assert_eq!(
+            (inline.range.start.line, inline.range.start.character),
+            (0, 5)
+        );
+    }
+
+    #[test]
+    fn test_generate_field_insertions_needs_a_struct() {
+        let name = field_info("name", "String");
+
+        assert!(generate_field_insertions(&[&name], "42").is_none());
+    }
+
+    #[test]
+    fn test_generate_explicit_type_actions_offer_root_and_field_edits() {
+        let uri = "file:///test.ron";
+        let type_info = struct_type_info("Item", vec![field_info("author", "Author")]);
+
+        let actions =
+            generate_explicit_type_actions("(id: 1, author: (value: 2))", &type_info, uri);
+        assert_eq!(
+            action_titles(&actions),
+            vec![
+                "Make struct name explicit: Item",
+                "Make field type explicit: author Author",
+            ]
+        );
+
+        let root = single_edit(&actions[0]);
+        assert_eq!(root.new_text, "Item");
+        assert_eq!((root.range.start.line, root.range.start.character), (0, 0));
+
+        let nested = single_edit(&actions[1]);
+        assert_eq!(nested.new_text, "Author");
+        assert_eq!(
+            (nested.range.start.line, nested.range.start.character),
+            (0, 16)
+        );
+    }
+
+    #[test]
+    fn test_generate_explicit_type_actions_skip_absent_fields() {
+        let uri = "file:///test.ron";
+        let type_info = struct_type_info("Item", vec![field_info("author", "Author")]);
+
+        // The named field is not part of the content, so only the root action
+        // is offered.
+        let actions = generate_explicit_type_actions("(id: 1)", &type_info, uri);
+        assert_eq!(
+            action_titles(&actions),
+            vec!["Make struct name explicit: Item"]
+        );
+    }
+
+    #[test]
+    fn test_generate_missing_field_actions_split_required_from_optional() {
+        let uri = "file:///test.ron";
+        let fields = vec![
+            field_info("name", "String"),
+            field_info("tag", "Option<String>"),
+        ];
+        let type_info = struct_type_info("Item", fields.clone());
+
+        let actions = generate_missing_field_actions("Item(\n)", &fields, &type_info, uri);
+        assert_eq!(
+            action_titles(&actions),
+            vec!["Add 1 required field", "Add all 2 missing fields"]
+        );
+
+        let required = single_edit(&actions[0]);
+        assert_eq!(required.new_text, "\n    name: \"\"\n");
+        assert_eq!(
+            (required.range.start.line, required.range.start.character),
+            (1, 0)
+        );
+
+        // Option fields are missing too, so they are included in the second edit.
+        let all = single_edit(&actions[1]);
+        assert_eq!(all.new_text, "\n    name: \"\",\n    tag: None\n");
+    }
+
+    #[test]
+    fn test_generate_missing_field_actions_with_defaulted_container() {
+        let uri = "file:///test.ron";
+        let fields = vec![
+            field_info("name", "String"),
+            field_info("tag", "Option<String>"),
+        ];
+        let mut type_info = struct_type_info("Item", fields.clone());
+        type_info.has_default = true;
+
+        // A container with `Default` makes every missing field optional.
+        let actions = generate_missing_field_actions("Item(\n)", &fields, &type_info, uri);
+        assert_eq!(action_titles(&actions), vec!["Add all 2 missing fields"]);
+    }
+
+    #[test]
+    fn test_generate_missing_field_actions_without_missing_fields() {
+        let uri = "file:///test.ron";
+        let fields = vec![
+            field_info("name", "String"),
+            field_info("tag", "Option<String>"),
+        ];
+        let type_info = struct_type_info("Item", fields.clone());
+        let content = "Item(\n    name: \"test\",\n    tag: None,\n)";
+
+        assert!(generate_missing_field_actions(content, &fields, &type_info, uri).is_empty());
+    }
 }

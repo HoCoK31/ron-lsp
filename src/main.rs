@@ -896,8 +896,8 @@ impl LanguageServer for Backend {
         };
 
         if let Some(type_path) = type_path {
-            // Конкретные значения поля важнее списка типов: если путь до поля
-            // разрешился и у поля есть перечисление — предлагаем его варианты.
+            // Concrete field values outrank the type list: when the path to the
+            // field resolves and the field holds an enum, offer its variants.
             if let Some(items) = completion::completions_for_field_path(
                 &content,
                 position,
@@ -1420,36 +1420,40 @@ mod tests {
     #[test]
     fn test_get_word_at_position_cyrillic() {
         // Slicing by a byte index used to panic on Cyrillic text (hover/goto)
-        let content = "// Реестр флагов (ADR-0021)\n";
+        let content = "// Пример строки (note)\n";
         assert_eq!(
             get_word_at_position(content, Position::new(0, 4)),
-            Some("Реестр".to_string())
+            Some("Пример".to_string())
         );
         assert_eq!(
             get_word_at_position(content, Position::new(0, 8)),
-            Some("Реестр".to_string())
+            Some("Пример".to_string())
         );
         // The word before the cursor
         assert_eq!(
             get_word_at_position(content, Position::new(0, 19)),
-            Some("ADR".to_string())
+            Some("note".to_string())
         );
         // Cursor on punctuation: take the word to the left
         assert_eq!(
             get_word_at_position(content, Position::new(0, 17)),
-            Some("флагов".to_string())
+            Some("строки".to_string())
         );
-        // Past the end of the line
-        assert_eq!(get_word_at_position(content, Position::new(0, 999)), None);
+        // Past the end of the line the column clamps to the line end, and the
+        // scan falls back to the trailing word when it starts with a letter
+        assert_eq!(
+            get_word_at_position(content, Position::new(0, 999)),
+            Some("note".to_string())
+        );
     }
 
     #[test]
     fn test_format_range_cyrillic() {
         // Range selection used to be sliced in bytes too
-        let line = "// Реестр флагов";
+        let line = "// Пример строки";
         let start = ts_utils::line_column_to_byte_offset(line, 3);
         let end = ts_utils::line_column_to_byte_offset(line, 9);
-        assert_eq!(&line[start..end], "Реестр");
+        assert_eq!(&line[start..end], "Пример");
     }
 
     #[test]
@@ -1749,6 +1753,66 @@ PostReference(
 
         // This test shows that all the building blocks work!
         // The problem must be in how goto_definition uses them
+    }
+
+    #[test]
+    fn test_create_location_response_uses_one_based_line() {
+        // The Rust side reports a 1-based line and a 0-based column
+        let file = std::env::current_dir().unwrap().join("Cargo.toml");
+        let response = create_location_response(&Some(file.clone()), Some(3), Some(7))
+            .unwrap()
+            .expect("an absolute path must produce a location");
+
+        let location = match response {
+            GotoDefinitionResponse::Scalar(location) => location,
+            other => panic!("expected a scalar location, got {other:?}"),
+        };
+        assert_eq!(location.uri.to_file_path().unwrap(), file);
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(2, 7), Position::new(2, 7))
+        );
+    }
+
+    #[test]
+    fn test_create_location_response_defaults_and_missing_input() {
+        let file = std::env::current_dir().unwrap().join("Cargo.toml");
+
+        // No line means the first line, no column means column 0
+        let response = create_location_response(&Some(file.clone()), None, None)
+            .unwrap()
+            .unwrap();
+        let location = match response {
+            GotoDefinitionResponse::Scalar(location) => location,
+            other => panic!("expected a scalar location, got {other:?}"),
+        };
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(0, 0), Position::new(0, 0))
+        );
+
+        // Line 0 of a 1-based line number saturates instead of underflowing
+        match create_location_response(&Some(file.clone()), Some(0), Some(4)).unwrap() {
+            Some(GotoDefinitionResponse::Scalar(location)) => assert_eq!(
+                location.range,
+                Range::new(Position::new(0, 4), Position::new(0, 4))
+            ),
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+
+        // Without a source file there is no location to point at
+        assert!(create_location_response(&None, Some(1), Some(0))
+            .unwrap()
+            .is_none());
+
+        // A relative path cannot be turned into a file URL
+        assert!(create_location_response(
+            &Some(std::path::PathBuf::from("src/main.rs")),
+            Some(1),
+            Some(0)
+        )
+        .unwrap()
+        .is_none());
     }
 }
 

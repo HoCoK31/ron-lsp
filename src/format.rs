@@ -496,4 +496,156 @@ mod tests {
         assert!(formatted.contains("User("));
         assert!(formatted.contains("    id: 1,"));
     }
+
+    #[test]
+    fn tuple_elements_go_on_their_own_lines() {
+        let once = format_ron("(1, 2,)");
+        let expected = "(
+    1,
+    2,
+)";
+        assert_eq!(once, expected);
+        // A trailing comma in the source normalizes to one comma per element
+        assert_eq!(format_ron("(1, 2)"), expected);
+        // Idempotent: a second pass changes nothing
+        assert_eq!(format_ron(&once), once);
+    }
+
+    #[test]
+    fn nested_tuples_indent_by_one_level() {
+        let expected = "(
+    (
+        1,
+        2,
+    ),
+    3,
+)";
+        assert_eq!(format_ron("((1, 2), 3)"), expected);
+    }
+
+    #[test]
+    fn tuple_struct_values_go_on_their_own_lines() {
+        // Values are separated by commas only between them, so the last one
+        // carries no comma (unlike fields, arrays and tuples)
+        let expected = "Pair(
+    1,
+    2
+)";
+        assert_eq!(format_ron("Pair(1, 2)"), expected);
+        assert_eq!(format_ron("Pair(1, 2,)"), expected);
+    }
+
+    #[test]
+    fn single_value_tuple_struct_stays_inline() {
+        assert_eq!(format_ron("Some(\"value\")"), "Some(\"value\")");
+
+        // The wrapper keeps one line, the wrapped struct still breaks, and its
+        // fields are indented relative to the inner level, not to the wrapper
+        let expected = "Wrap(Inner(
+        a: 1,
+    ))";
+        assert_eq!(format_ron("Wrap(Inner(a: 1))"), expected);
+    }
+
+    #[test]
+    fn inline_wrapper_does_not_inline_container_values() {
+        // The inline flag only reaches structs: an array breaks anyway
+        let expected = "Some([
+        1,
+    ])";
+        assert_eq!(format_ron("Some([1])"), expected);
+    }
+
+    #[test]
+    fn comments_between_tuple_struct_values_are_kept() {
+        // A comment takes a line of its own and no comma; the separator is
+        // index based, so the value after it is still the last one
+        let expected = "Pair(
+    1,
+    /* keep */
+    2
+)";
+        assert_eq!(format_ron("Pair(1, /* keep */ 2)"), expected);
+    }
+
+    #[test]
+    fn comments_between_tuple_elements_are_kept() {
+        // Every element gets a comma, only the comment is left without one
+        let expected = "(
+    1,
+    // note
+    2,
+)";
+        assert_eq!(format_ron("(1, // note\n2)"), expected);
+    }
+
+    #[test]
+    fn comment_in_array_keeps_its_own_line_without_comma() {
+        // Comments before the first and after the last element both stay put
+        let expected = "[
+    // note
+    1,
+    /* after */
+]";
+        let input = "[\n    // note\n    1,\n    /* after */\n]\n";
+        assert_eq!(format_ron(input), expected);
+    }
+
+    #[test]
+    fn array_elements_go_on_their_own_lines() {
+        let expected = "[\n    1,\n    2,\n]";
+        assert_eq!(format_ron("[1, 2]"), expected);
+        assert_eq!(format_ron("[1, 2,]"), expected);
+    }
+
+    #[test]
+    fn map_entries_go_on_their_own_lines() {
+        let expected = r#"{
+    "a": 1,
+    "b": 2,
+}"#;
+        assert_eq!(format_ron("{\"a\": 1, \"b\": 2}"), expected);
+        assert_eq!(format_ron("{\"a\": 1, \"b\": 2,}"), expected);
+    }
+
+    #[test]
+    fn nested_structs_indent_by_one_level() {
+        let expected = "A(
+    b: B(
+        c: 1,
+    ),
+)";
+        assert_eq!(format_ron("A(b: B(c: 1))"), expected);
+    }
+
+    #[test]
+    fn empty_containers_stay_compact() {
+        assert_eq!(format_ron("[]"), "[]");
+        assert_eq!(format_ron("{}"), "{}");
+        // `()` is the unit value, not an empty container
+        assert_eq!(format_ron("()"), "()");
+    }
+
+    #[test]
+    fn leaf_values_keep_their_source_text() {
+        for (input, expected) in [
+            ("42", "42"),
+            ("-1_000", "-1_000"),
+            ("1.5", "1.5"),
+            ("true", "true"),
+            ("'c'", "'c'"),
+            ("\"text\"", "\"text\""),
+            ("Bare", "Bare"),
+        ] {
+            assert_eq!(format_ron(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn input_without_a_main_value_is_returned_verbatim() {
+        assert_eq!(format_ron(""), "");
+        // Comments alone carry no value to format, so nothing is rewritten
+        assert_eq!(format_ron("// only"), "// only");
+        assert_eq!(format_ron("/* only */"), "/* only */");
+    }
 }

@@ -716,7 +716,7 @@ fn check_enum_variant_node(
 ///
 /// The distinction has to be explicit. A list element has no field text of its own,
 /// so the RON-value checks read the whole list by field name and report valid enum
-/// variants as "expected StatCarrier, got ()" — a false positive that appeared
+/// variants as "expected Kind, got ()" — a false positive that appeared
 /// whenever this function validated a `Vec<Enum>` field successfully and the caller
 /// still fell through to them.
 async fn validate_field_value_node<'a>(
@@ -1645,8 +1645,8 @@ pub fn validate_ron_syntax(content: &str) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// Parse error position from RON error message
-/// Ведущая позиция сообщения RON: `16:20: …` (строка и столбец, 1-индексные).
+/// Parse the leading position of a RON message: `16:20: …` (line and column,
+/// 1-indexed as written there, 0-indexed in the returned pair).
 fn leading_position(message: &str) -> Option<(u32, u32)> {
     let (line, rest) = message.trim_start().split_once(':')?;
     let (col, _) = rest.split_once(':')?;
@@ -1655,16 +1655,16 @@ fn leading_position(message: &str) -> Option<(u32, u32)> {
     Some((line.saturating_sub(1), col.saturating_sub(1)))
 }
 
-/// Диапазон синтаксической ошибки: точку берём у самого дерева — в нём есть узел
-/// ошибки ровно там, где сломался разбор (`duration: 6a0` — это `a0`, а не начало
-/// файла). Текст ошибки RON — запасной вариант: его формат `16:20` не всегда
-/// разбирается, и тогда диагностика вставала на `1:1`.
+/// Range of a syntax error: the position is taken from the tree itself — it holds
+/// an error node exactly where parsing broke (`duration: 6a0` is `a0`, not the
+/// start of the file). The RON error text is the fallback: its `16:20` form is not
+/// always parsed, and the diagnostic then used to land on `1:1`.
 fn syntax_error_range(content: &str, error_msg: &str) -> Range {
     use crate::ts_utils::{self, RonParser};
 
-    // Сообщение RON начинается с позиции (`16:20: Expected comma`) — это и есть
-    // место ошибки; дерево же восстанавливается после сбоя и может показать
-    // следующую беду, а не первую.
+    // A RON message starts with the position (`16:20: Expected comma`) — that is
+    // the error site itself; the tree, by contrast, recovers after the failure and
+    // may point at the next trouble rather than the first one.
     if let Some((line, col)) = leading_position(error_msg) {
         return Range::new(Position::new(line, col), Position::new(line, col + 1));
     }
@@ -1673,8 +1673,8 @@ fn syntax_error_range(content: &str, error_msg: &str) -> Range {
         let mut errors = Vec::new();
         collect_error_nodes(&tree.root_node(), &mut errors);
 
-        // Внешние узлы-ошибки просто содержат остальные: оставляем самые вложенные
-        // и берём первый слева — он и есть место, где разбор сломался.
+        // Outer error nodes merely contain the others: keep the innermost ones and
+        // take the leftmost — that is where parsing broke.
         let innermost: Vec<_> = errors
             .iter()
             .copied()
@@ -1696,7 +1696,7 @@ fn syntax_error_range(content: &str, error_msg: &str) -> Range {
     Range::new(Position::new(line, col), Position::new(line, col + 1))
 }
 
-/// Собирает все узлы-ошибки поддерева (включая пропущенные токены).
+/// Collect every error node of a subtree (missing tokens included).
 fn collect_error_nodes<'a>(node: &tree_sitter::Node<'a>, found: &mut Vec<tree_sitter::Node<'a>>) {
     if node.is_error() || node.is_missing() {
         found.push(*node);
@@ -1731,8 +1731,8 @@ fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
     // Try to find "X:Y" pattern (common in parsers)
     if let Some(colon_pos) = error_msg.find(':') {
         let before = error_msg[..colon_pos].trim();
-        // Номер строки может стоять в самом начале сообщения ("16:20: Expected comma"),
-        // тогда перед ним нет ничего, что можно было бы отрезать.
+        // The line number may sit at the very start of the message ("16:20: Expected
+        // comma"), and then there is nothing before it to cut off.
         let line_str = match before.rfind(|c: char| !c.is_numeric()) {
             Some(index) => &before[index + 1..],
             None => before,
@@ -1828,15 +1828,15 @@ mod tests {
             struct Param { name: String, #[serde(rename = "type")] ty: String }
 
             #[derive(serde::Deserialize)]
-            struct Flag { key: String, params: Vec<Param> }
+            struct Root { key: String, params: Vec<Param> }
         "#;
         std::fs::write(root.join("src/lib.rs"), source).unwrap();
         let analyzer = Arc::new(RustAnalyzer::new());
         analyzer.set_workspace_root(&root).await;
-        let info = analyzer.get_type_info("Flag").await.unwrap();
+        let info = analyzer.get_type_info("Root").await.unwrap();
 
         // `type` is the name the field is visible under in RON
-        let valid = r#"Flag(key: "flag.x", params: [Param(name: "target", type: "self")])"#;
+        let valid = r#"Root(key: "rule.a", params: [Param(name: "child", type: "value")])"#;
         let diagnostics = validate_ron_with_analyzer(valid, &info, analyzer.clone()).await;
         assert!(
             diagnostics.is_empty(),
@@ -1845,7 +1845,7 @@ mod tests {
         );
 
         // The Rust name `ty` is an error in data
-        let invalid = r#"Flag(key: "flag.x", params: [Param(name: "target", ty: "self")])"#;
+        let invalid = r#"Root(key: "rule.a", params: [Param(name: "child", ty: "value")])"#;
         let diagnostics = validate_ron_with_analyzer(invalid, &info, analyzer.clone()).await;
         let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
         assert!(
@@ -3075,23 +3075,23 @@ PostReference(Post(
     ///
     /// The node-based validation handles arrays element by element; the RON-value
     /// fallback cannot resolve enum variants inside a list (there is no field text
-    /// for an element), so it used to emit "in Vec: expected StatCarrier, got ()".
+    /// for an element), so it used to emit "in Vec: expected Kind, got ()".
     #[tokio::test]
     async fn test_vec_of_enum_field_is_not_a_mismatch() {
         let analyzer = Arc::new(RustAnalyzer::new());
         analyzer
             .insert_type_for_test(TypeInfo {
-                name: "StatCarrier".to_string(),
+                name: "Kind".to_string(),
                 kind: TypeKind::Enum(vec![
                     EnumVariant {
-                        name: "creature".to_string(),
+                        name: "item".to_string(),
                         fields: vec![],
                         docs: None,
                         line: None,
                         column: None,
                     },
                     EnumVariant {
-                        name: "item".to_string(),
+                        name: "group".to_string(),
                         fields: vec![],
                         docs: None,
                         line: None,
@@ -3107,10 +3107,10 @@ PostReference(Post(
             .await;
 
         let type_info = TypeInfo {
-            name: "StatDef".to_string(),
+            name: "Container".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
-                name: "applies_to".to_string(),
-                type_name: "Vec<StatCarrier>".to_string(),
+                name: "kinds".to_string(),
+                type_name: "Vec<Kind>".to_string(),
                 docs: None,
                 line: None,
                 column: None,
@@ -3123,10 +3123,10 @@ PostReference(Post(
             has_default: false,
         };
 
-        let content = r#"StatDef(
-    applies_to: [
-        creature,
+        let content = r#"Container(
+    kinds: [
         item,
+        group,
     ],
 )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
@@ -3136,9 +3136,9 @@ PostReference(Post(
         );
 
         // An unknown variant is still an error, reported once.
-        let content = r#"StatDef(
-    applies_to: [
-        creature,
+        let content = r#"Container(
+    kinds: [
+        item,
         bogus,
     ],
 )"#;
@@ -3155,7 +3155,7 @@ PostReference(Post(
         );
     }
 
-    /// Tuple-struct fields are positional: an element of `Vec<FlagReach>` is a tuple,
+    /// Tuple-struct fields are positional: an element of `Vec<Pair>` is a tuple,
     /// its fields have no names, and the enum inside has to be judged on the node.
     #[tokio::test]
     async fn test_tuple_struct_fields_are_validated() {
@@ -3187,47 +3187,46 @@ PostReference(Post(
 
         analyzer
             .insert_type_for_test(type_of(
-                "FlagTarget",
+                "Kind",
                 TypeKind::Enum(vec![
                     variant("Any"),
-                    variant("Creature"),
                     variant("Item"),
-                    variant("Terrain"),
-                    variant("Effect"),
+                    variant("Group"),
+                    variant("Inner"),
                 ]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "FlagDirection",
+                "Direction",
                 TypeKind::Enum(vec![variant("Up"), variant("Down")]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "FlagReach",
-                TypeKind::Struct(vec![field("0", "FlagTarget"), field("1", "FlagDirection")]),
+                "Pair",
+                TypeKind::Struct(vec![field("0", "Kind"), field("1", "Direction")]),
             ))
             .await;
         let type_info = type_of(
-            "FlagUse",
-            TypeKind::Struct(vec![field("target", "Vec<FlagReach>")]),
+            "Container",
+            TypeKind::Struct(vec![field("pairs", "Vec<Pair>")]),
         );
 
-        let good = "FlagUse(\n    target: [\n        (Effect, Up),\n    ],\n)";
+        let good = "Container(\n    pairs: [\n        (Item, Up),\n    ],\n)";
         let diagnostics = validate_ron_with_analyzer(good, &type_info, analyzer.clone()).await;
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 
-        let typo = "FlagUse(\n    target: [\n        (Effeect, Up),\n    ],\n)";
+        let typo = "Container(\n    pairs: [\n        (Inneer, Up),\n    ],\n)";
         let diagnostics = validate_ron_with_analyzer(typo, &type_info, analyzer.clone()).await;
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(
-            diagnostics[0].message.contains("Effeect"),
+            diagnostics[0].message.contains("Inneer"),
             "{:?}",
             diagnostics[0].message
         );
 
-        let short = "FlagUse(\n    target: [\n        (Effect),\n    ],\n)";
+        let short = "Container(\n    pairs: [\n        (Item),\n    ],\n)";
         let diagnostics = validate_ron_with_analyzer(short, &type_info, analyzer).await;
         assert!(
             diagnostics
@@ -3243,9 +3242,9 @@ PostReference(Post(
     async fn test_map_values_are_validated() {
         let analyzer = Arc::new(RustAnalyzer::new());
         let type_info = TypeInfo {
-            name: "EffectLike".to_string(),
+            name: "Rule".to_string(),
             kind: TypeKind::Struct(vec![FieldInfo {
-                name: "stats".to_string(),
+                name: "values".to_string(),
                 type_name: "Option<HashMap<String, String>>".to_string(),
                 docs: None,
                 line: None,
@@ -3259,11 +3258,11 @@ PostReference(Post(
             has_default: false,
         };
 
-        let good = "EffectLike(\n    stats: {\n        \"stat.a\": \"2.0\",\n    },\n)";
+        let good = "Rule(\n    values: {\n        \"key.a\": \"2.0\",\n    },\n)";
         let diagnostics = validate_ron_with_analyzer(good, &type_info, analyzer.clone()).await;
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 
-        let bad = "EffectLike(\n    stats: {\n        \"stat.a\": 0.5,\n    },\n)";
+        let bad = "Rule(\n    values: {\n        \"key.a\": 0.5,\n    },\n)";
         let diagnostics = validate_ron_with_analyzer(bad, &type_info, analyzer).await;
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(
@@ -3297,17 +3296,17 @@ PostReference(Post(
         };
         analyzer
             .insert_type_for_test(type_of(
-                "Slot",
-                TypeKind::Struct(vec![field("kind", "String"), field("count", "u32")]),
+                "Row",
+                TypeKind::Struct(vec![field("name", "String"), field("count", "u32")]),
             ))
             .await;
-        let type_info = type_of("Limb", TypeKind::Struct(vec![field("slots", "Vec<Slot>")]));
+        let type_info = type_of("Table", TypeKind::Struct(vec![field("rows", "Vec<Row>")]));
 
-        let good = "Limb(slots: [(kind: \"slot.a\", count: 2)])";
+        let good = "Table(rows: [(name: \"row.a\", count: 2)])";
         let diagnostics = validate_ron_with_analyzer(good, &type_info, analyzer.clone()).await;
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 
-        let bad = "Limb(slots: [(kind: \"slot.a\", count: h)])";
+        let bad = "Table(rows: [(name: \"row.a\", count: h)])";
         let diagnostics = validate_ron_with_analyzer(bad, &type_info, analyzer).await;
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(
@@ -3319,28 +3318,28 @@ PostReference(Post(
         );
     }
 
-    /// Синтаксическая ошибка встаёт на сломанный токен, а не на начало файла.
+    /// A syntax error lands on the broken token, not on the start of the file.
     #[test]
     fn syntax_error_range_points_at_the_broken_token() {
-        let content = "Doc(
+        let content = "Root(
     duration: 6a0,
     stacks: 3,
 )";
         let range = syntax_error_range(content, "Expected comma at 2:20");
         assert_eq!(
             range.start.line, 1,
-            "строка с `6a0`, а не первая: {range:?}"
+            "the line with `6a0`, not the first one: {range:?}"
         );
 
         let line = content.lines().nth(1).unwrap();
         let token = u32::try_from(line.find("6a0").unwrap()).unwrap();
         assert!(
             range.start.character >= token && range.end.character <= token + 3,
-            "диапазон пересекает сломанный токен: {range:?}"
+            "the range has to cover the broken token: {range:?}"
         );
     }
 
-    /// Позиция из сообщения RON читается и когда номер строки стоит в самом начале.
+    /// The position from a RON message is read even when the line number sits at the very start.
     #[test]
     fn ron_error_position_is_parsed() {
         assert_eq!(parse_error_position("16:20: Expected comma", ""), (15, 19));
@@ -3348,5 +3347,467 @@ PostReference(Post(
             parse_error_position("at line 4 column 7: Expected identifier", ""),
             (3, 6)
         );
+    }
+
+    /// `adjust_diagnostic_positions` shifts the lines by the variant's offset and
+    /// leaves the columns — and the message — alone.
+    #[test]
+    fn adjust_diagnostic_positions_shifts_lines_only() {
+        let diagnostics = vec![Diagnostic {
+            range: Range::new(Position::new(2, 3), Position::new(4, 1)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "mismatch".to_string(),
+            ..Default::default()
+        }];
+
+        let shifted = adjust_diagnostic_positions(diagnostics, 5);
+
+        assert_eq!(shifted.len(), 1);
+        assert_eq!(shifted[0].range.start, Position::new(7, 3));
+        assert_eq!(shifted[0].range.end, Position::new(9, 1));
+        assert_eq!(shifted[0].message, "mismatch");
+    }
+
+    /// `leading_position` reads the `16:20: …` prefix of a RON message and converts
+    /// both numbers to 0-indexed ones.
+    #[test]
+    fn leading_position_reads_the_ron_prefix() {
+        assert_eq!(leading_position("16:20: Expected comma"), Some((15, 19)));
+        assert_eq!(leading_position("  3:1: Expected comma"), Some((2, 0)));
+        // 1-indexed input is clamped, never underflowed.
+        assert_eq!(leading_position("0:0: Expected comma"), Some((0, 0)));
+        // Not a position prefix: either the second colon or the digits are missing.
+        assert_eq!(leading_position("Expected comma at 2:20"), None);
+        assert_eq!(leading_position("16:20 Expected comma"), None);
+    }
+
+    /// `parse_error_position` falls back to the missing-comma heuristic and, when
+    /// even that finds nothing, to the start of the file.
+    #[test]
+    fn parse_error_position_falls_back_line_by_line() {
+        let missing_comma = "Root(\n    duration: 6\n    stacks: 3,\n)";
+        assert_eq!(
+            parse_error_position("unexpected token", missing_comma),
+            (1, 14),
+            "the line before the field line ends without a comma"
+        );
+
+        assert_eq!(parse_error_position("unexpected token", "Root()"), (0, 0));
+    }
+
+    /// `simplify_ron_error` maps the punctuation RON complains about onto a short
+    /// hint and keeps the rest of the message otherwise.
+    #[test]
+    fn simplify_ron_error_names_the_missing_token() {
+        assert_eq!(
+            simplify_ron_error("2:20: expected `,` instead"),
+            "Expected comma between fields"
+        );
+        assert_eq!(
+            simplify_ron_error("2:21: expected `:` instead"),
+            "Expected colon after field name"
+        );
+        assert_eq!(
+            simplify_ron_error("3:1: expected closing `)`"),
+            "Expected closing parenthesis"
+        );
+        assert_eq!(
+            simplify_ron_error("3:1: expected closing `}`"),
+            "Expected closing brace"
+        );
+        assert_eq!(
+            simplify_ron_error("3:1: expected closing `]`"),
+            "Expected closing bracket"
+        );
+
+        // The wording of the input decides which branch matches: "unexpected" starts
+        // uppercase in RON's own messages.
+        assert_eq!(
+            simplify_ron_error("unexpected end of RON"),
+            "Syntax error: end of RON"
+        );
+        assert_eq!(
+            simplify_ron_error("Unexpected end of RON"),
+            "RON syntax error: Unexpected end of RON"
+        );
+        assert_eq!(
+            simplify_ron_error("bad input"),
+            "RON syntax error: bad input"
+        );
+    }
+
+    /// `validate_ron_syntax` reports one error diagnostic whose range spans a single
+    /// column, and stays quiet for valid RON.
+    #[test]
+    fn validate_ron_syntax_marks_one_column() {
+        assert!(validate_ron_syntax("Root(duration: 6, stacks: 3)").is_empty());
+
+        let diagnostics = validate_ron_syntax("Root(\n    duration: 6,\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(!diagnostics[0].message.is_empty());
+        assert_eq!(
+            diagnostics[0].range.end.line, diagnostics[0].range.start.line,
+            "the range stays on one line"
+        );
+        assert_eq!(
+            diagnostics[0].range.end.character,
+            diagnostics[0].range.start.character + 1
+        );
+    }
+
+    /// `check_type_mismatch` names the kind of the value it found, and recurses into
+    /// a `Vec` element type.
+    #[test]
+    fn check_type_mismatch_names_the_found_kind() {
+        assert_eq!(check_type_mismatch(&Value::Bool(true), "bool"), None);
+        assert_eq!(
+            check_type_mismatch(&Value::Bool(true), "u32"),
+            Some("expected u32, got bool".to_string())
+        );
+
+        assert_eq!(
+            check_type_mismatch(&Value::String("x".to_string()), "str"),
+            None
+        );
+        assert_eq!(
+            check_type_mismatch(&Value::String("x".to_string()), "u32"),
+            Some("expected u32, got string".to_string())
+        );
+
+        let integer = ron::from_str::<Value>("5").unwrap();
+        assert_eq!(check_type_mismatch(&integer, "u32"), None);
+        assert_eq!(
+            check_type_mismatch(&integer, "f64"),
+            Some("expected f64, got integer".to_string())
+        );
+
+        let float = ron::from_str::<Value>("1.5").unwrap();
+        assert_eq!(check_type_mismatch(&float, "f64"), None);
+        assert_eq!(
+            check_type_mismatch(&float, "u32"),
+            Some("expected u32, got float".to_string())
+        );
+        assert_eq!(
+            check_type_mismatch(&float, "String"),
+            Some("expected String, got number".to_string())
+        );
+
+        assert_eq!(check_type_mismatch(&Value::Unit, "()"), None);
+        assert_eq!(
+            check_type_mismatch(&Value::Unit, "u32"),
+            Some("expected u32, got ()".to_string())
+        );
+
+        assert_eq!(
+            check_type_mismatch(&Value::Seq(vec![Value::Bool(true)]), "Vec<bool>"),
+            None
+        );
+        assert_eq!(
+            check_type_mismatch(
+                &Value::Seq(vec![Value::Number(ron::Number::I32(1))]),
+                "Vec<bool>"
+            ),
+            Some("in Vec: expected bool, got number".to_string())
+        );
+    }
+
+    /// `check_type_mismatch_deep` reads the field's raw RON text for custom types,
+    /// because the parsed value no longer carries the type name.
+    #[test]
+    fn check_type_mismatch_deep_reads_the_raw_field_text() {
+        let content = "Root(value: Other(1))";
+        let value = ron::from_str::<Value>(content).unwrap();
+
+        assert_eq!(
+            check_type_mismatch_deep(&value, "Root", content, "value"),
+            Some("expected Root, got Other".to_string())
+        );
+        // The type name in the text matches the declared one.
+        assert_eq!(
+            check_type_mismatch_deep(&value, "Other", content, "value"),
+            None
+        );
+        // A field that is not in the text has nothing to read.
+        assert_eq!(
+            check_type_mismatch_deep(&value, "Root", content, "missing"),
+            None
+        );
+
+        let bare = "Root(value: 1)";
+        let value = ron::from_str::<Value>(bare).unwrap();
+        assert_eq!(
+            check_type_mismatch_deep(&value, "Root", bare, "value"),
+            Some("expected Root, got integer".to_string())
+        );
+
+        let quoted = "Root(value: \"x\")";
+        let value = ron::from_str::<Value>(quoted).unwrap();
+        assert_eq!(
+            check_type_mismatch_deep(&value, "Root", quoted, "value"),
+            Some("expected Root, got string".to_string())
+        );
+
+        // Primitives are left to the plain type check, which does not need the text.
+        assert_eq!(
+            check_type_mismatch_deep(&Value::Bool(true), "bool", "", "value"),
+            None
+        );
+        assert_eq!(
+            check_type_mismatch_deep(&Value::Bool(true), "u32", "", "value"),
+            Some("expected u32, got bool".to_string())
+        );
+    }
+
+    /// `extract_inner_type` unwraps exactly one generic layer.
+    #[test]
+    fn extract_inner_type_unwraps_one_layer() {
+        assert_eq!(
+            extract_inner_type("Vec<u32>", "Vec<"),
+            Some("u32".to_string())
+        );
+        assert_eq!(
+            extract_inner_type("Option<Vec<u32>>", "Option<"),
+            Some("Vec<u32>".to_string())
+        );
+        // Wrong wrapper, and a generic that is never closed.
+        assert_eq!(extract_inner_type("String", "Vec<"), None);
+        assert_eq!(extract_inner_type("Vec<u32", "Vec<"), None);
+    }
+
+    /// `split_map_type` splits at the top-level comma only, so nested generics stay
+    /// in one piece.
+    #[test]
+    fn split_map_type_honours_nested_generics() {
+        assert_eq!(split_map_type("String, u32"), Some(("String", "u32")));
+        assert_eq!(
+            split_map_type("String, Vec<HashMap<String, u32>>"),
+            Some(("String", "Vec<HashMap<String, u32>>"))
+        );
+        assert_eq!(split_map_type("String"), None);
+        assert_eq!(split_map_type(""), None);
+    }
+
+    /// `is_primitive_type` and `is_std_generic_type` ignore the spaces the analyzer
+    /// keeps in declared types.
+    #[test]
+    fn type_classification_ignores_spaces() {
+        assert!(is_primitive_type("u32"));
+        assert!(is_primitive_type(" String "));
+        assert!(!is_primitive_type("Kind"));
+        assert!(!is_primitive_type("Vec<u32>"));
+
+        assert!(is_std_generic_type("Vec<Row>"));
+        assert!(is_std_generic_type("Option<Item>"));
+        assert!(is_std_generic_type("HashMap<String, u32>"));
+        assert!(!is_std_generic_type("Row"));
+        assert!(!is_std_generic_type("Vec"));
+    }
+
+    /// `is_tuple_struct` recognises the positional field names the analyzer writes
+    /// for a tuple struct.
+    #[test]
+    fn is_tuple_struct_reads_positional_field_names() {
+        let fields = |names: &[&str]| -> Vec<FieldInfo> {
+            names
+                .iter()
+                .map(|name| FieldInfo {
+                    name: (*name).to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                })
+                .collect()
+        };
+
+        assert!(is_tuple_struct(&fields(&["0", "1"])));
+        assert!(is_tuple_struct(&fields(&["0"])));
+        assert!(!is_tuple_struct(&fields(&["0", "name"])));
+        assert!(!is_tuple_struct(&fields(&[])));
+    }
+
+    /// `extract_map_from_value` keeps maps — named-struct RON included — and rejects
+    /// every other value.
+    #[test]
+    fn extract_map_from_value_keeps_only_maps() {
+        let map = ron::from_str::<Value>("{ \"a\": 1 }").unwrap();
+        assert_eq!(extract_map_from_value(&map).map(|m| m.len()), Some(1));
+
+        let named = ron::from_str::<Value>("Root(a: 1)").unwrap();
+        assert_eq!(extract_map_from_value(&named).map(|m| m.len()), Some(1));
+
+        let number = ron::from_str::<Value>("1").unwrap();
+        assert!(extract_map_from_value(&number).is_none());
+    }
+
+    /// `find_field_value_position` spans the value node of the named field.
+    #[test]
+    fn find_field_value_position_spans_the_value() {
+        assert_eq!(
+            find_field_value_position("Root(a: 1)", "a"),
+            Some((0, 8, 9))
+        );
+        assert_eq!(find_field_value_position("Root(a: 1)", "b"), None);
+    }
+
+    /// `find_struct_name_position` spans the name of a named struct and falls back
+    /// to the `(0, 0, 1)` sentinel when the root is not a struct.
+    #[test]
+    fn find_struct_name_position_reports_the_name_span() {
+        assert_eq!(find_struct_name_position("Root(a: 1)"), (0, 0, 4));
+        assert_eq!(
+            find_struct_name_position("\nRoot(\n    a: 1,\n)"),
+            (1, 0, 4)
+        );
+        assert_eq!(find_struct_name_position("42"), (0, 0, 1));
+    }
+
+    /// `find_variant_position` locates the first standalone uppercase identifier and
+    /// reports `(0, 0)` when the text does not occur.
+    #[test]
+    fn find_variant_position_locates_the_variant_text() {
+        let content = "Root(state: Item, count: 1)";
+        assert_eq!(find_variant_position(content, "Root"), (0, 0));
+        assert_eq!(find_variant_position(content, "Item"), (0, 12));
+        assert_eq!(find_variant_position(content, "state"), (0, 0));
+        assert_eq!(find_variant_position(content, "Missing"), (0, 0));
+    }
+
+    /// `pick_struct_node` reports only the non-struct elements of a root array: a
+    /// root that is neither an array nor a struct stays unreported.
+    #[test]
+    fn pick_struct_node_reports_array_elements_only() {
+        use crate::ts_utils::{self, RonParser};
+
+        let mut parser = RonParser::new();
+        let tree = parser.parse("[1, Root(a: 1)]").unwrap();
+        let root = ts_utils::find_main_value(&tree).unwrap();
+
+        let mut diagnostics = Vec::new();
+        let chosen = pick_struct_node(root, Some(1), &mut diagnostics)
+            .expect("the second element is a struct");
+        assert_eq!(chosen.kind(), "struct");
+        assert!(diagnostics.is_empty());
+
+        let mut diagnostics = Vec::new();
+        assert!(pick_struct_node(root, Some(0), &mut diagnostics).is_none());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("expected struct, got integer"),
+            "{:?}",
+            diagnostics[0].message
+        );
+
+        let mut diagnostics = Vec::new();
+        assert!(pick_struct_node(root, None, &mut diagnostics).is_none());
+        assert!(pick_struct_node(root, Some(9), &mut diagnostics).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    /// `check_primitive_node` judges a value by its tree-sitter kind, since a map
+    /// value has no field of its own to read.
+    #[test]
+    fn check_primitive_node_judges_by_node_kind() {
+        use crate::ts_utils::{self, RonParser};
+
+        let mut parser = RonParser::new();
+
+        let tree = parser.parse("true").unwrap();
+        let node = ts_utils::find_main_value(&tree).unwrap();
+        assert!(check_primitive_node(&node, "bool").is_none());
+
+        let diagnostic = check_primitive_node(&node, "u32").expect("a boolean is not a u32");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diagnostic.message.contains("expected u32, got boolean"),
+            "{:?}",
+            diagnostic.message
+        );
+
+        // A name this checker does not know is not its business.
+        assert!(check_primitive_node(&node, "Kind").is_none());
+
+        // An integer is acceptable where a float is declared.
+        let integer_tree = parser.parse("1").unwrap();
+        let integer_node = ts_utils::find_main_value(&integer_tree).unwrap();
+        assert!(check_primitive_node(&integer_node, "f32").is_none());
+
+        let float_tree = parser.parse("1.5").unwrap();
+        let float_node = ts_utils::find_main_value(&float_tree).unwrap();
+        let diagnostic = check_primitive_node(&float_node, "u32").expect("a float is not a u32");
+        assert!(
+            diagnostic.message.contains("expected u32, got float"),
+            "{:?}",
+            diagnostic.message
+        );
+    }
+
+    /// `collect_error_nodes` walks into the nested error nodes, so the broken token
+    /// ends up in the list.
+    #[test]
+    fn collect_error_nodes_finds_the_broken_token() {
+        use crate::ts_utils::RonParser;
+
+        let content = "Root(\n    duration: 6a0,\n    stacks: 3,\n)";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).unwrap();
+
+        let mut found = Vec::new();
+        collect_error_nodes(&tree.root_node(), &mut found);
+
+        assert!(
+            !found.is_empty(),
+            "the broken token has to leave an error node"
+        );
+        assert!(found
+            .iter()
+            .all(|node| node.is_error() || node.is_missing()));
+
+        let token = content.find("6a0").unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|node| node.start_byte() <= token + 3 && node.end_byte() >= token),
+            "an error node has to cover `6a0`: {found:?}"
+        );
+    }
+
+    /// The portable wrappers keep the severity and the line of the diagnostics they
+    /// convert.
+    #[cfg(feature = "cli")]
+    #[tokio::test]
+    async fn portable_wrappers_map_syntax_errors() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Root".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "duration".to_string(),
+                type_name: "u32".to_string(),
+                docs: None,
+                line: None,
+                column: None,
+                has_default: false,
+            }]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        let broken = "Root(\n    duration: 6,\n";
+        let lsp = validate_ron_with_analyzer(broken, &type_info, analyzer.clone()).await;
+        let portable = validate_ron_portable(broken, &type_info, analyzer).await;
+
+        assert_eq!(lsp.len(), 1, "{lsp:#?}");
+        assert_eq!(portable.len(), lsp.len());
+        assert_eq!(portable[0].severity, diagnostic_reporter::Severity::Error);
+        assert_eq!(portable[0].line, lsp[0].range.start.line);
+
+        assert!(validate_ron_syntax_portable("Root(duration: 6)").is_empty());
     }
 }

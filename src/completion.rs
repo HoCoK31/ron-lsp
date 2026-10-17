@@ -556,7 +556,7 @@ async fn generate_value_completions_by_type(
     completions
 }
 
-/// Разворачивает обёртки `Vec<…>`, `Option<…>`, `Box<…>` до полезного типа.
+/// Unwraps `Vec<…>`, `Option<…>`, `Box<…>` wrappers down to the payload type.
 fn unwrap_wrapper(type_name: &str) -> String {
     let mut current = type_name.replace(' ', "");
     loop {
@@ -574,17 +574,17 @@ fn unwrap_wrapper(type_name: &str) -> String {
     }
 }
 
-/// Шаг пути от корня файла до места под курсором.
+/// One step of the path from the file root down to the cursor.
 #[derive(Debug, PartialEq)]
 enum Step {
-    /// Поле структуры по имени.
+    /// A struct field by name.
     Field(String),
-    /// Элемент кортежа: у структуры-кортежа поля зовутся "0", "1", …, поэтому
-    /// позиция значения и есть имя поля.
+    /// A tuple element: a tuple struct names its fields "0", "1", …, so the
+    /// position of the value is the field name.
     Element(usize),
 }
 
-/// Является ли `ancestor` предком `node` (или самим узлом).
+/// Whether `ancestor` is an ancestor of `node` (or the node itself).
 fn node_is_ancestor_or_self(ancestor: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
     let mut current = Some(node);
     while let Some(candidate) = current {
@@ -596,20 +596,20 @@ fn node_is_ancestor_or_self(ancestor: tree_sitter::Node<'_>, node: tree_sitter::
     false
 }
 
-/// Текст узла из исходника.
+/// The text of a node taken from the source.
 fn node_text<'a>(node: &tree_sitter::Node<'_>, content: &'a str) -> &'a str {
     content
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
 }
 
-/// Значения незакрытой группы `(` внутри узла: у правила цели поля позиционные,
-/// и в момент набора первого значения кортеж ещё может быть `ERROR`-ом.
+/// Values of an unclosed `(` group inside the node: the fields of the pair are
+/// positional, and while the first value is being typed the tuple may still be an `ERROR`.
 fn values_in_open_paren<'t>(
     node: &tree_sitter::Node<'t>,
     offset: usize,
 ) -> Option<Vec<tree_sitter::Node<'t>>> {
-    // Структура в скобках (`( key: …, flags: [ … ] )`) — не кортеж.
+    // A struct in parentheses (`( key: …, items: [ … ] )`) is not a tuple.
     if node.kind() == "struct" {
         return None;
     }
@@ -637,7 +637,7 @@ fn values_in_open_paren<'t>(
         .filter(|child| child.start_byte() >= open.end_byte())
         .collect();
 
-    // Именованные поля — тоже структура, а не кортеж правила.
+    // Named fields mean a struct as well, not a tuple.
     if values.iter().any(|child| child.kind() == "field") {
         return None;
     }
@@ -645,23 +645,23 @@ fn values_in_open_paren<'t>(
     Some(values)
 }
 
-/// Путь шагов от корня файла до места под курсором.
+/// The path of steps from the file root down to the cursor.
 fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     use crate::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
 
-    // Курсор в редакторе стоит за последним набранным символом, поэтому позиция
-    // может попасть на пробел или запятую: тогда узел берётся по байту перед
-    // курсором, если он глубже — так `delivery: [ ],` и `(Ef|) ` находят своё поле.
+    // The editor cursor sits after the last typed character, so the position may
+    // land on a space or a comma: the node is then taken from the byte before the
+    // cursor when that one is deeper — this is how `items: [ ],` and `(Kind|) ` find their field.
     let offset = ts_utils::position_to_byte_offset(content, position);
     let root = tree.root_node();
     let after = root.descendant_for_byte_range(offset, offset);
     let before_offset = offset.saturating_sub(1);
     let before = root.descendant_for_byte_range(before_offset, before_offset);
-    // Значение перед курсором важнее пунктуации под ним: `(Ef|` и `(Ef,|` — это
-    // одно и то же место пути, а запятая сама по себе ничего не говорит.
+    // The value before the cursor matters more than the punctuation under it:
+    // `(Kind|` and `(Kind,|` are the same path position, and a comma alone says nothing.
     let is_value = |kind: &str| {
         matches!(
             kind,
@@ -686,9 +686,9 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
             }
         }
 
-        // Позиция в правиле цели: группа в скобках — не обязательно `tuple`.
-        // `(e` без запятой парсер ещё не считает кортежем и держит в ERROR,
-        // поэтому ищем саму `(` и нумеруем значения после неё.
+        // A position inside the pair: a group in parentheses is not necessarily a `tuple`.
+        // Without a comma the parser does not treat `(k` as a tuple yet and keeps it in an
+        // ERROR, so the `(` itself is searched for and the values after it are numbered.
         if let Some(values) = values_in_open_paren(&node, offset) {
             if let Some(index) = values
                 .iter()
@@ -699,8 +699,8 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
             }
         }
 
-        // Сломанное поле: имя осталось соседним идентификатором (`target`), а
-        // `: [ …` ушло в ERROR — берём имя у соседа слева.
+        // Broken field: the name is left as a neighbouring identifier (`choices`), while
+        // `: [ …` goes into an ERROR — the name is taken from the left neighbour.
         if node_text(&node, content).trim_start().starts_with(':') {
             if let Some(previous) = node.prev_named_sibling() {
                 if previous.kind() == "identifier" {
@@ -711,11 +711,11 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
         current = node.parent();
     }
     path.reverse();
-    debug_log(&format!("цепочка узлов: {chain:?}"));
+    debug_log(&format!("node chain: {chain:?}"));
 
-    // Значение ещё не набрано: курсор стоит за `mode:`, и узла-значения в дереве
-    // нет. Имя поля берём из текста слева — иначе путь обрывается и подсказки
-    // откатываются к списку полей структуры.
+    // The value is not typed yet: the cursor sits after `kind:`, and there is no value
+    // node in the tree. The field name is taken from the text on the left — otherwise
+    // the path breaks and the completions fall back to the struct's field list.
     if let Some(name) = field_name_left_of_cursor(content, offset) {
         if path.last() != Some(&Step::Field(name.clone())) {
             path.push(Step::Field(name));
@@ -725,7 +725,7 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     (!path.is_empty()).then_some(path)
 }
 
-/// Имя поля, если курсор стоит сразу за его двоеточием (`mode: |`).
+/// The field name when the cursor sits right after its colon (`kind: |`).
 fn field_name_left_of_cursor(content: &str, offset: usize) -> Option<String> {
     let left = content.get(..offset)?;
     let line = left.rsplit('\n').next()?;
@@ -745,7 +745,7 @@ fn field_name_left_of_cursor(content: &str, offset: usize) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Тип после шага пути: поле структуры или значение структуры-кортежа.
+/// The type after a path step: a struct field or an element of a tuple struct.
 async fn step_type(
     analyzer: &Arc<RustAnalyzer>,
     current: &TypeInfo,
@@ -755,15 +755,15 @@ async fn step_type(
     analyzer.get_type_info(&unwrap_wrapper(&type_name)).await
 }
 
-/// Имя типа, который записан в поле (или в позиции кортежа) текущего типа.
+/// The name of the type written in a field (or in a tuple position) of the current type.
 async fn field_type_name(
     analyzer: &Arc<RustAnalyzer>,
     current: &TypeInfo,
     step: &Step,
 ) -> Option<String> {
-    // Массив в RON пишется как есть: `target: [ (Effect, Up) ]` — шаг пути
-    // относится к элементу массива, поэтому обёртки (`Vec<T>`, `Option<T>`)
-    // снимаются до применения шага.
+    // An array is written in RON as is: `choices: [ (Kind, Direction) ]` — the path
+    // step refers to an array element, so the wrappers (`Vec<T>`, `Option<T>`) are
+    // unwrapped before the step is applied.
     let base = analyzer
         .get_type_info(&unwrap_wrapper(&current.name))
         .await
@@ -781,7 +781,7 @@ async fn field_type_name(
     }
 }
 
-/// Временный журнал для разбора подсказок: включается `RON_LSP_DEBUG_COMPLETION`.
+/// Temporary log for debugging completions: enabled by `RON_LSP_DEBUG_COMPLETION`.
 fn debug_log(message: &str) {
     if std::env::var_os("RON_LSP_DEBUG_COMPLETION").is_none() {
         return;
@@ -797,15 +797,7 @@ fn debug_log(message: &str) {
     }
 }
 
-/// Подсказки для значения, найденного по пути от курсора вверх.
-///
-/// Навигация по контекстам аннотаций не спускается ни в `Vec<T>`, ни во вложенные
-/// структуры, ни в кортежи: `delivery` живёт в `DamageEntry` внутри `damage: [...]`,
-/// а правило цели — в структуре-кортеже `FlagReach`. Здесь путь берётся из дерева
-/// (имена полей и номера значений кортежей от корня до курсора), каждый шаг
-/// разворачивает обёртки и берёт тип у текущей структуры; на месте значения
-/// предлагаются варианты перечисления — и только они.
-/// Стоит ли курсор внутри строки (`"…"`).
+/// Whether the cursor sits inside a string (`"…"`).
 fn cursor_inside_string(content: &str, position: Position) -> bool {
     use crate::ts_utils::{self, RonParser};
 
@@ -824,24 +816,32 @@ fn cursor_inside_string(content: &str, position: Position) -> bool {
     false
 }
 
+/// Completions for the value found by the path from the cursor upwards.
+///
+/// Annotation-context navigation descends neither into `Vec<T>`, nor into nested
+/// structs, nor into tuples: `choices` lives in `Item` inside `items: [...]`, and the
+/// pair is the tuple struct `Pair`. Here the path comes from the tree (field names and
+/// tuple element indices from the root down to the cursor), every step unwraps the
+/// wrappers and takes the type from the current struct; at the value position the enum
+/// variants are offered — and only they.
 pub async fn completions_for_field_path(
     content: &str,
     position: Position,
     top_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Option<Vec<CompletionItem>> {
-    // Внутри строки подсказывать нечего: незакрытая кавычка «съедает» остаток
-    // файла, и любой список был бы выдумкой.
+    // There is nothing to suggest inside a string: an unclosed quote swallows the rest
+    // of the file, and any list would be made up.
     if cursor_inside_string(content, position) {
         return Some(Vec::new());
     }
 
     let path = path_at_position(content, position)?;
-    debug_log(&format!("путь: {path:?}"));
+    debug_log(&format!("path: {path:?}"));
     let (last, enclosing) = path.split_last()?;
 
     let mut current = analyzer.get_type_info(top_type).await?;
-    debug_log(&format!("корень {top_type} -> {}", current.name));
+    debug_log(&format!("root {top_type} -> {}", current.name));
     for step in enclosing {
         match step_type(&analyzer, &current, step).await {
             Some(next) => {
@@ -854,7 +854,7 @@ pub async fn completions_for_field_path(
                     .map(|list| list.iter().map(|field| field.name.clone()).collect())
                     .unwrap_or_default();
                 debug_log(&format!(
-                    "  {step:?} -> РАЗРЫВ (текущий {}: {fields:?})",
+                    "  {step:?} -> BREAK (current {}: {fields:?})",
                     current.name
                 ));
                 return None;
@@ -862,11 +862,11 @@ pub async fn completions_for_field_path(
         }
     }
 
-    // Тип последнего шага известен: отвечаем сами — «все типы проекта» здесь
-    // были бы шумом. Перечисление — варианты, структура — её поля, примитив
-    // (`String`, числа) — ничего.
+    // The type of the last step is known: the answer is produced here — "all types of
+    // the project" would only be noise. An enum gives its variants, a struct gives its
+    // fields, a primitive (`String`, numbers) gives nothing.
     let Some(type_name) = field_type_name(&analyzer, &current, last).await else {
-        debug_log(&format!("  последний {last:?} -> поля нет"));
+        debug_log(&format!("  last {last:?} -> no such field"));
         return None;
     };
     let Some(inner) = analyzer.get_type_info(&unwrap_wrapper(&type_name)).await else {
@@ -901,6 +901,42 @@ pub async fn completions_for_field_path(
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo, TypeInfo, TypeKind};
+
+    /// A field with only a name and a type: docs, position and default are irrelevant here.
+    fn field(name: &str, type_name: &str) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        }
+    }
+
+    /// A type with the given name and shape, without docs or a source position.
+    fn type_of(name: &str, kind: TypeKind) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            kind,
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        }
+    }
+
+    /// A unit enum variant.
+    fn variant(name: &str) -> EnumVariant {
+        EnumVariant {
+            name: name.to_string(),
+            fields: vec![],
+            docs: None,
+            line: None,
+            column: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_enum_variant_field_completion() {
@@ -1013,7 +1049,7 @@ mod tests {
         assert!(variant_labels.contains(&"UnitVariant".to_string()));
         assert!(variant_labels.contains(&"TupleVariant".to_string()));
     }
-    /// Путь до поля собирается из дерева, а его тип разворачивается через `Vec`.
+    /// The path to the field is collected from the tree, and its type is unwrapped through `Vec`.
     #[tokio::test]
     async fn nested_field_offers_enum_variants() {
         use crate::rust_analyzer::{EnumVariant, FieldInfo};
@@ -1038,29 +1074,29 @@ mod tests {
         };
         analyzer
             .insert_type_for_test(type_of(
-                "DocTest",
-                TypeKind::Struct(vec![field("damage", "Vec<DamageEntry>")]),
+                "Root",
+                TypeKind::Struct(vec![field("items", "Vec<Item>")]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "DamageEntry",
-                TypeKind::Struct(vec![field("delivery", "Vec<Delivery>")]),
+                "Item",
+                TypeKind::Struct(vec![field("choices", "Vec<Choice>")]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "Delivery",
+                "Choice",
                 TypeKind::Enum(vec![
                     EnumVariant {
-                        name: "Melee".to_string(),
+                        name: "Alpha".to_string(),
                         fields: vec![],
                         docs: None,
                         line: None,
                         column: None,
                     },
                     EnumVariant {
-                        name: "Ranged".to_string(),
+                        name: "Beta".to_string(),
                         fields: vec![],
                         docs: None,
                         line: None,
@@ -1070,30 +1106,30 @@ mod tests {
             ))
             .await;
 
-        let content = "DocTest(
-    damage: [
+        let content = "Root(
+    items: [
         (
-            delivery: [
-                
+            choices: [
+
             ],
         ),
     ],
 )";
-        let path = path_at_position(content, Position::new(4, 16)).expect("путь до поля");
+        let path = path_at_position(content, Position::new(3, 22)).expect("path to the field");
         assert_eq!(
             path,
-            vec![Step::Field("damage".into()), Step::Field("delivery".into())]
+            vec![Step::Field("items".into()), Step::Field("choices".into())]
         );
 
-        let items = completions_for_field_path(content, Position::new(4, 16), "DocTest", analyzer)
+        let items = completions_for_field_path(content, Position::new(3, 22), "Root", analyzer)
             .await
-            .expect("подсказки для перечисления");
+            .expect("completions for the enum");
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-        assert_eq!(labels, vec!["Melee", "Ranged"]);
+        assert_eq!(labels, vec!["Alpha", "Beta"]);
     }
 
-    /// Правило цели — структура-кортеж: курсор внутри значения кортежа, и вариант
-    /// перечисления берётся по позиции этого значения.
+    /// The pair is a tuple struct: the cursor sits inside a tuple value, and the enum
+    /// variant is taken by the position of that value.
     #[tokio::test]
     async fn tuple_element_offers_enum_variants() {
         use crate::rust_analyzer::{EnumVariant, FieldInfo};
@@ -1125,104 +1161,438 @@ mod tests {
         };
         analyzer
             .insert_type_for_test(type_of(
-                "EffectTest",
-                TypeKind::Struct(vec![field("flags", "Vec<FlagUse>")]),
+                "Root",
+                TypeKind::Struct(vec![field("items", "Vec<Item>")]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "FlagUse",
-                TypeKind::Struct(vec![
-                    field("key", "String"),
-                    field("target", "Vec<FlagReach>"),
-                ]),
+                "Item",
+                TypeKind::Struct(vec![field("key", "String"), field("choices", "Vec<Pair>")]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "FlagReach",
-                TypeKind::Struct(vec![field("0", "FlagTarget"), field("1", "FlagDirection")]),
+                "Pair",
+                TypeKind::Struct(vec![field("0", "Kind"), field("1", "Direction")]),
             ))
             .await;
         analyzer
             .insert_type_for_test(type_of(
-                "FlagTarget",
+                "Kind",
                 TypeKind::Enum(vec![
                     variant("Any"),
                     variant("Creature"),
                     variant("Item"),
-                    variant("Effect"),
+                    variant("Object"),
                 ]),
             ))
             .await;
 
-        let content = "EffectTest(
-    flags: [
+        let content = "Root(
+    items: [
         (
-            key: \"flag.ability_add\",
-            target: [
+            key: \"pair.alpha\",
+            choices: [
                 (
-                    Ef,
-                    Up,
+                    Kind,
+                    Direction,
                 ),
             ],
         ),
     ],
 )";
-        let path = path_at_position(content, Position::new(6, 21)).expect("путь до правила");
+        let path = path_at_position(content, Position::new(6, 21)).expect("path to the pair");
         assert_eq!(
             path,
             vec![
-                Step::Field("flags".into()),
-                Step::Field("target".into()),
+                Step::Field("items".into()),
+                Step::Field("choices".into()),
                 Step::Element(0),
             ]
         );
 
-        let items =
-            completions_for_field_path(content, Position::new(6, 21), "EffectTest", analyzer)
-                .await
-                .expect("варианты цели");
+        let items = completions_for_field_path(content, Position::new(6, 21), "Root", analyzer)
+            .await
+            .expect("variants of the kind");
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-        assert_eq!(labels, vec!["Any", "Creature", "Item", "Effect"]);
+        assert_eq!(labels, vec!["Any", "Creature", "Item", "Object"]);
 
-        // Значение ещё не набрано: курсор стоит на самом кортеже — позиция берётся
-        // по первому сыну, который начинается не раньше курсора.
-        let on_tuple = path_at_position(content, Position::new(5, 17)).expect("путь до кортежа");
+        // The value is not typed yet: the cursor sits on the tuple itself — the position
+        // is taken from the first child that starts no earlier than the cursor.
+        let on_tuple = path_at_position(content, Position::new(5, 17)).expect("path to the tuple");
         assert_eq!(
             on_tuple,
             vec![
-                Step::Field("flags".into()),
-                Step::Field("target".into()),
+                Step::Field("items".into()),
+                Step::Field("choices".into()),
                 Step::Element(0),
             ]
         );
     }
 
-    /// Первое значение правила набрано без запятой: кортежа в дереве ещё нет
-    /// (парсер держит `( e` в ERROR), но позиция всё равно читается.
+    /// The first value of the pair is typed without a comma: there is no tuple in the
+    /// tree yet (the parser keeps `( k` in an ERROR), but the position is still read.
     #[test]
     fn tuple_element_is_found_before_the_comma() {
-        let content = "EffectTest(
-    flags: [
+        let content = "Root(
+    items: [
         (
-            key: \"flag.ability_add\",
-            target: [
+            key: \"pair.alpha\",
+            choices: [
                 (
-                    e
+                    k
                 ),
             ],
         ),
     ],
 )";
-        let path = path_at_position(content, Position::new(6, 21)).expect("путь до правила");
+        let path = path_at_position(content, Position::new(6, 21)).expect("path to the pair");
         assert_eq!(
             path,
             vec![
-                Step::Field("flags".into()),
-                Step::Field("target".into()),
+                Step::Field("items".into()),
+                Step::Field("choices".into()),
                 Step::Element(0),
             ]
         );
+    }
+
+    /// Fields already written in the RON file are not offered again.
+    #[test]
+    fn field_completions_skip_fields_already_used() {
+        let owner = type_of(
+            "Root",
+            TypeKind::Struct(vec![field("items", "Vec<Item>"), field("key", "String")]),
+        );
+
+        let items =
+            generate_field_completions("Root(\n    items: [],\n)", Position::new(1, 4), &owner);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["key"]);
+        assert_eq!(items[0].insert_text.as_deref(), Some("key: "));
+    }
+
+    /// The cursor context: a type in the value position, a value, or a field name.
+    #[test]
+    fn completion_context_follows_the_cursor() {
+        let value = "Root(\n    kind: Va,\n)";
+        assert_eq!(
+            get_completion_context(value, Position::new(1, 11)),
+            CompletionContext::StructType
+        );
+        // The same line with the cursor inside the field name, and right on its colon.
+        assert_eq!(
+            get_completion_context(value, Position::new(1, 5)),
+            CompletionContext::FieldName
+        );
+        assert_eq!(
+            get_completion_context(value, Position::new(1, 8)),
+            CompletionContext::FieldName
+        );
+
+        // An array value is not a type name.
+        let array = "Root(\n    kind: [\n    ],\n)";
+        assert_eq!(
+            get_completion_context(array, Position::new(2, 2)),
+            CompletionContext::FieldValue
+        );
+
+        // No field under the cursor at all.
+        assert_eq!(
+            get_completion_context("", Position::new(0, 0)),
+            CompletionContext::FieldName
+        );
+    }
+
+    /// The type name before an opening paren is read from the line under the cursor.
+    #[test]
+    fn current_type_context_reads_the_name_before_the_paren() {
+        assert_eq!(
+            find_current_type_context("Root(\n    items: Item(\n", Position::new(1, 16)),
+            Some("Item".to_string())
+        );
+        assert_eq!(
+            find_current_type_context("Root(\n    Item(\n", Position::new(1, 9)),
+            Some("Item".to_string())
+        );
+        // A lowercase name is not a type, and the line may not exist at all.
+        assert_eq!(
+            find_current_type_context("Root(\n    items: item(\n", Position::new(1, 16)),
+            None
+        );
+        assert_eq!(
+            find_current_type_context("Root(\n", Position::new(9, 0)),
+            None
+        );
+    }
+
+    /// The field under the cursor is taken from the enclosing `field` node.
+    #[test]
+    fn current_field_is_taken_from_the_enclosing_field_node() {
+        let content = "Root(\n    kind: Va,\n)";
+        assert_eq!(
+            find_current_field(content, Position::new(1, 11)),
+            Some("kind".to_string())
+        );
+        // Inside the field name the same `field` node is found.
+        assert_eq!(
+            find_current_field(content, Position::new(1, 5)),
+            Some("kind".to_string())
+        );
+        // The value is not typed yet: `kind:` stays in an ERROR and there is no `field` node.
+        assert_eq!(
+            find_current_field("Root(\n    kind: \n)", Position::new(1, 8)),
+            None
+        );
+        assert_eq!(find_current_field("", Position::new(0, 0)), None);
+    }
+
+    /// A string is detected by the node the cursor sits in.
+    #[test]
+    fn cursor_inside_string_matches_the_string_node() {
+        let content = "Root(\n    kind: \"abc\",\n)";
+        assert!(cursor_inside_string(content, Position::new(1, 12)));
+        // After the closing quote the cursor is back in the field.
+        assert!(!cursor_inside_string(content, Position::new(1, 15)));
+        assert!(!cursor_inside_string(
+            "Root(\n    kind: Va,\n)",
+            Position::new(1, 11)
+        ));
+    }
+
+    /// The field name is read from the text before the cursor.
+    #[test]
+    fn field_name_left_of_cursor_reads_the_identifier_before_the_colon() {
+        assert_eq!(
+            field_name_left_of_cursor("    kind: ", 10),
+            Some("kind".to_string())
+        );
+        assert_eq!(
+            field_name_left_of_cursor("    kind:", 9),
+            Some("kind".to_string())
+        );
+        assert_eq!(
+            field_name_left_of_cursor("items: [\n    kind: Va", 20),
+            Some("kind".to_string())
+        );
+        // No colon, a name that is not an identifier, nothing before the cursor, or an
+        // offset past the end of the text.
+        assert_eq!(field_name_left_of_cursor("    items", 9), None);
+        assert_eq!(field_name_left_of_cursor("    1: ", 7), None);
+        assert_eq!(field_name_left_of_cursor("    a-b: ", 9), None);
+        assert_eq!(field_name_left_of_cursor("kind: ", 0), None);
+        assert_eq!(field_name_left_of_cursor("kind: ", 100), None);
+    }
+
+    /// Wrappers are stripped down to the payload type.
+    #[test]
+    fn unwrap_wrapper_strips_known_wrappers() {
+        assert_eq!(unwrap_wrapper("Vec<Kind>"), "Kind");
+        assert_eq!(unwrap_wrapper("Option<Vec<Direction>>"), "Direction");
+        assert_eq!(unwrap_wrapper("Box< Option< Inner > >"), "Inner");
+        assert_eq!(unwrap_wrapper("Rc<Arc<Kind>>"), "Kind");
+        assert_eq!(unwrap_wrapper("Kind"), "Kind");
+        assert_eq!(unwrap_wrapper(""), "");
+        // No closing `>` — nothing to unwrap.
+        assert_eq!(unwrap_wrapper("Vec<Kind"), "Vec<Kind");
+        // Spaces are dropped even for a type that is not a wrapper.
+        assert_eq!(
+            unwrap_wrapper("HashMap<String, Kind>"),
+            "HashMap<String,Kind>"
+        );
+    }
+
+    /// The inner type of a generic is cut out of the text of the type.
+    #[test]
+    fn extract_inner_type_unwraps_one_level() {
+        assert_eq!(extract_inner_type("Vec<Kind>"), "Kind");
+        assert_eq!(extract_inner_type("Option< Vec< Kind > >"), "Vec<Kind>");
+        assert_eq!(extract_inner_type("HashMap<String, Kind>"), "String,Kind");
+        assert_eq!(extract_inner_type("Kind"), "Kind");
+        // Without a closing `>` the original text is returned unchanged.
+        assert_eq!(extract_inner_type("Option< Kind"), "Option< Kind");
+    }
+
+    /// A type completion carries the snippet of the struct or the enum it describes.
+    #[test]
+    fn create_type_completion_builds_a_snippet() {
+        let mut owner = type_of(
+            "module::Root",
+            TypeKind::Struct(vec![field("items", "Vec<Item>"), field("key", "String")]),
+        );
+        owner.docs = Some("Root docs".to_string());
+
+        let item = create_type_completion(&owner);
+        assert_eq!(item.label, "Root");
+        assert_eq!(item.kind, Some(CompletionItemKind::STRUCT));
+        assert_eq!(item.detail.as_deref(), Some("struct module::Root"));
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("Root(\n    items: ${1},\n    key: ${2},\n)")
+        );
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        match item.documentation {
+            Some(Documentation::MarkupContent(markup)) => assert_eq!(markup.value, "Root docs"),
+            other => panic!("expected markdown documentation, got {other:?}"),
+        }
+
+        // An enum offers its name only: the variants are suggested separately.
+        let kind = create_type_completion(&type_of(
+            "module::Kind",
+            TypeKind::Enum(vec![variant("Any")]),
+        ));
+        assert_eq!(kind.label, "Kind");
+        assert_eq!(kind.kind, Some(CompletionItemKind::ENUM));
+        assert_eq!(kind.insert_text.as_deref(), Some("Kind($0)"));
+    }
+
+    /// Tree helpers: text slicing, the ancestor walk, and the values of an open paren.
+    #[test]
+    fn tree_helpers_read_the_parsed_ron() {
+        use crate::ts_utils::{self, RonParser};
+
+        let content = "Root(\n    items: [ (Kind, Direction,) ],\n)";
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content).expect("tree");
+        let root = tree.root_node();
+
+        assert_eq!(node_text(&root, content), content);
+
+        let offset = ts_utils::position_to_byte_offset(content, Position::new(1, 17));
+        let element = root
+            .descendant_for_byte_range(offset, offset)
+            .expect("node at the cursor");
+        assert_eq!(node_text(&element, content), "Kind");
+
+        let mut tuple = element;
+        while tuple.kind() != "tuple" {
+            tuple = tuple.parent().expect("enclosing tuple");
+        }
+        assert_eq!(node_text(&tuple, content), "(Kind, Direction,)");
+
+        // The ancestor walk goes upwards only, and a node is its own ancestor.
+        assert!(node_is_ancestor_or_self(root, element));
+        assert!(node_is_ancestor_or_self(tuple, element));
+        assert!(node_is_ancestor_or_self(element, element));
+        assert!(!node_is_ancestor_or_self(element, tuple));
+        assert!(!node_is_ancestor_or_self(element, root));
+        let second = tuple.named_child(1).expect("second tuple element");
+        assert!(!node_is_ancestor_or_self(second, element));
+
+        // Both positional values of the open paren are listed in order.
+        let values = values_in_open_paren(&tuple, offset).expect("values in the open paren");
+        let texts: Vec<&str> = values
+            .iter()
+            .map(|value| node_text(value, content))
+            .collect();
+        assert_eq!(texts, vec!["Kind", "Direction"]);
+
+        // Once the closing paren is behind the offset the group is complete.
+        let after = ts_utils::position_to_byte_offset(content, Position::new(1, 31));
+        assert!(values_in_open_paren(&tuple, after).is_none());
+
+        // A struct in parentheses is not a tuple.
+        let mut group = element;
+        while group.kind() != "struct" {
+            group = group.parent().expect("enclosing struct");
+        }
+        assert!(values_in_open_paren(&group, offset).is_none());
+    }
+
+    /// Value completions of a field come from the type written in it.
+    #[tokio::test]
+    async fn value_completions_follow_the_field_type() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "Kind",
+                TypeKind::Enum(vec![variant("Any"), variant("Object")]),
+            ))
+            .await;
+
+        let owner = type_of("Root", TypeKind::Struct(vec![field("kind", "Kind")]));
+        let items =
+            generate_value_completions_for_field("kind".to_string(), &owner, analyzer.clone())
+                .await;
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["Any", "Object"]);
+
+        // A field the type does not have gives nothing.
+        assert!(
+            generate_value_completions_for_field("missing".to_string(), &owner, analyzer)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Value completions of primitive types and containers.
+    #[tokio::test]
+    async fn value_completions_cover_primitive_types() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let labels = |items: Vec<CompletionItem>| {
+            items
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            labels(generate_value_completions_by_type("bool", analyzer.clone()).await),
+            vec!["true", "false"]
+        );
+        assert_eq!(
+            labels(generate_value_completions_by_type("String", analyzer.clone()).await),
+            vec!["\"\""]
+        );
+        assert_eq!(
+            labels(generate_value_completions_by_type("u32", analyzer).await),
+            vec!["0"]
+        );
+    }
+
+    /// A field whose type is a custom type offers that type.
+    #[tokio::test]
+    async fn type_completions_follow_the_field_type() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "Item",
+                TypeKind::Struct(vec![field("key", "String")]),
+            ))
+            .await;
+
+        let owner = type_of("Root", TypeKind::Struct(vec![field("items", "Vec<Item>")]));
+        let items =
+            generate_type_completions_for_field("items".to_string(), &owner, analyzer.clone())
+                .await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Item");
+        assert_eq!(items[0].kind, Some(CompletionItemKind::STRUCT));
+
+        assert!(
+            generate_type_completions_for_field("missing".to_string(), &owner, analyzer)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Every type of the workspace is offered as a type completion.
+    #[tokio::test]
+    async fn workspace_types_are_offered() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        assert!(get_all_workspace_types(analyzer.clone()).await.is_empty());
+
+        analyzer
+            .insert_type_for_test(type_of(
+                "Root",
+                TypeKind::Struct(vec![field("key", "String")]),
+            ))
+            .await;
+
+        let items = get_all_workspace_types(analyzer).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Root");
+        assert_eq!(items[0].kind, Some(CompletionItemKind::STRUCT));
     }
 }
