@@ -122,18 +122,61 @@ impl Backend {
         }
     }
 
-    async fn register_config_file_watching(&self) -> anyhow::Result<()> {
+    /// Watch the two things that can change the model behind an annotation: the
+    /// mapping file and the Rust sources that declare the types.
+    /// Rust sources changed, so the analyzer's snapshot of the workspace is stale:
+    /// types, their fields, enum variants and custom deserializers all come from
+    /// them. Re-scan, then re-validate every open document — an edit in `src/` has to
+    /// show up in a RON file without the user restarting the language server.
+    async fn rust_sources_changed(&self) {
+        self.rust_analyzer.scan_workspace().await;
+
+        let open: Vec<(String, String, Option<String>)> = {
+            let documents = self.documents.read().await;
+            documents
+                .iter()
+                .map(|(uri, doc)| {
+                    (
+                        uri.clone(),
+                        doc.content.clone(),
+                        doc.type_annotation.clone(),
+                    )
+                })
+                .collect()
+        };
+        let count = open.len();
+
+        for (uri, content, annotation) in open {
+            self.publish_diagnostics(&uri, &content, annotation.as_deref())
+                .await;
+        }
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Rust sources changed: re-scanned the workspace, re-checked {count} open file(s)."),
+            )
+            .await;
+    }
+
+    async fn register_file_watching(&self) -> anyhow::Result<()> {
         let options = DidChangeWatchedFilesRegistrationOptions {
-            watchers: vec![FileSystemWatcher {
-                glob_pattern: GlobPattern::String(format!("**/{CONFIG_FILE_NAME}")),
-                kind: None,
-            }],
+            watchers: vec![
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String(format!("**/{CONFIG_FILE_NAME}")),
+                    kind: None,
+                },
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/*.rs".to_string()),
+                    kind: None,
+                },
+            ],
         };
 
         let r = Ok(self
             .client
             .register_capability(vec![Registration {
-                id: "ron-toml-watcher".to_string(),
+                id: "ron-lsp-watcher".to_string(),
                 method: "workspace/didChangeWatchedFiles".to_string(),
                 register_options: Some(serde_json::to_value(options)?),
             }])
@@ -143,7 +186,7 @@ impl Backend {
             self.client
                 .log_message(
                     MessageType::INFO,
-                    format!("Watching {CONFIG_FILE_NAME} for changes."),
+                    format!("Watching {CONFIG_FILE_NAME} and Rust sources for changes."),
                 )
                 .await;
         }
@@ -287,7 +330,7 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "RON LSP server initialized!")
             .await;
 
-        self.register_config_file_watching()
+        self.register_file_watching()
             .await
             .expect("failed to register config file watching");
     }
@@ -344,12 +387,13 @@ impl LanguageServer for Backend {
         &self,
         DidChangeWatchedFilesParams { changes, .. }: DidChangeWatchedFilesParams,
     ) {
+        let mut rust_sources_changed = false;
+
         for FileEvent { uri, .. } in changes.iter() {
-            let Some(file_name) = uri
-                .to_file_path()
-                .ok()
-                .and_then(|path| path.file_name().map(ToOwned::to_owned))
-            else {
+            let Some(path) = uri.to_file_path().ok() else {
+                continue;
+            };
+            let Some(file_name) = path.file_name() else {
                 continue;
             };
 
@@ -358,7 +402,17 @@ impl LanguageServer for Backend {
                 return;
             }
 
-            self.client.log_message(MessageType::WARNING, format!("Got a workspace/didChangeWatchedFiles notification for {}, but it is not implemented", file_name.display())).await;
+            // Rust sources are the model. Build output is not, so `target/` is skipped:
+            // a compile would otherwise re-scan the workspace on every generated file.
+            let is_rust = path.extension().is_some_and(|extension| extension == "rs");
+            let in_build_output = path.components().any(|part| part.as_os_str() == "target");
+            if is_rust && !in_build_output {
+                rust_sources_changed = true;
+            }
+        }
+
+        if rust_sources_changed {
+            self.rust_sources_changed().await;
         }
     }
 
