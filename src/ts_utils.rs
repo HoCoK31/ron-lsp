@@ -368,7 +368,11 @@ fn collect_potential_variants<'a>(node: &Node<'a>, content: &str, results: &mut 
                     .map(|p| p.kind() == "field" && p.child(0).map(|c| c.id()) == Some(node.id()))
                     .unwrap_or(false);
 
-                if !is_field_name {
+                // Tuple elements are judged by the node-based field validation,
+                // which knows the field's type; the file-wide pass only handles
+                // values that stand on their own (a scalar enum field).
+                let in_tuple = find_ancestor_by_kind(*node, "tuple").is_some();
+                if !is_field_name && !in_tuple {
                     results.push(*node);
                 }
             }
