@@ -596,6 +596,55 @@ fn node_is_ancestor_or_self(ancestor: tree_sitter::Node<'_>, node: tree_sitter::
     false
 }
 
+/// Текст узла из исходника.
+fn node_text<'a>(node: &tree_sitter::Node<'_>, content: &'a str) -> &'a str {
+    content
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+}
+
+/// Значения незакрытой группы `(` внутри узла: у правила цели поля позиционные,
+/// и в момент набора первого значения кортеж ещё может быть `ERROR`-ом.
+fn values_in_open_paren<'t>(
+    node: &tree_sitter::Node<'t>,
+    offset: usize,
+) -> Option<Vec<tree_sitter::Node<'t>>> {
+    // Структура в скобках (`( key: …, flags: [ … ] )`) — не кортеж.
+    if node.kind() == "struct" {
+        return None;
+    }
+
+    let mut open = None;
+    let mut closed = false;
+    for index in 0..node.child_count() {
+        let child = node.child(index)?;
+        match child.kind() {
+            "(" if child.start_byte() <= offset => {
+                open = Some(child);
+                closed = false;
+            }
+            ")" if open.is_some() && child.start_byte() < offset => closed = true,
+            _ => {}
+        }
+    }
+    let open = open?;
+    if closed {
+        return None;
+    }
+
+    let values: Vec<tree_sitter::Node<'t>> = node
+        .named_children(&mut node.walk())
+        .filter(|child| child.start_byte() >= open.end_byte())
+        .collect();
+
+    // Именованные поля — тоже структура, а не кортеж правила.
+    if values.iter().any(|child| child.kind() == "field") {
+        return None;
+    }
+
+    Some(values)
+}
+
 /// Путь шагов от корня файла до места под курсором.
 fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     use crate::ts_utils::{self, RonParser};
@@ -631,27 +680,33 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     let mut chain = Vec::new();
     while let Some(node) = current {
         chain.push(node.kind().to_string());
-        match node.kind() {
-            "field" => {
-                if let Some(name) = ts_utils::field_name(&node, content) {
-                    path.push(Step::Field(name.to_string()));
+        if node.kind() == "field" {
+            if let Some(name) = ts_utils::field_name(&node, content) {
+                path.push(Step::Field(name.to_string()));
+            }
+        }
+
+        // Позиция в правиле цели: группа в скобках — не обязательно `tuple`.
+        // `(e` без запятой парсер ещё не считает кортежем и держит в ERROR,
+        // поэтому ищем саму `(` и нумеруем значения после неё.
+        if let Some(values) = values_in_open_paren(&node, offset) {
+            if let Some(index) = values
+                .iter()
+                .position(|value| node_is_ancestor_or_self(*value, cursor))
+                .or_else(|| values.iter().position(|value| value.start_byte() >= offset))
+            {
+                path.push(Step::Element(index));
+            }
+        }
+
+        // Сломанное поле: имя осталось соседним идентификатором (`target`), а
+        // `: [ …` ушло в ERROR — берём имя у соседа слева.
+        if node_text(&node, content).trim_start().starts_with(':') {
+            if let Some(previous) = node.prev_named_sibling() {
+                if previous.kind() == "identifier" {
+                    path.push(Step::Field(node_text(&previous, content).to_string()));
                 }
             }
-            "tuple" => {
-                // Номер значения, внутри которого стоит курсор: правило цели
-                // `(Effect, Up)` — структура-кортеж, её поля позиционные.
-                let values = ts_utils::named_children(&node);
-                // Курсор может стоять на самом кортеже (`( |` или `Effect, |`):
-                // тогда позиция — первый сын, начинающийся не раньше курсора.
-                if let Some(index) = values
-                    .iter()
-                    .position(|value| node_is_ancestor_or_self(*value, cursor))
-                    .or_else(|| values.iter().position(|value| value.start_byte() >= offset))
-                {
-                    path.push(Step::Element(index));
-                }
-            }
-            _ => {}
         }
         current = node.parent();
     }
@@ -750,12 +805,37 @@ fn debug_log(message: &str) {
 /// (имена полей и номера значений кортежей от корня до курсора), каждый шаг
 /// разворачивает обёртки и берёт тип у текущей структуры; на месте значения
 /// предлагаются варианты перечисления — и только они.
+/// Стоит ли курсор внутри строки (`"…"`).
+fn cursor_inside_string(content: &str, position: Position) -> bool {
+    use crate::ts_utils::{self, RonParser};
+
+    let offset = ts_utils::position_to_byte_offset(content, position);
+    let Some(tree) = RonParser::new().parse(content) else {
+        return false;
+    };
+    let mut node = tree.root_node().descendant_for_byte_range(offset, offset);
+    while let Some(current) = node {
+        match current.kind() {
+            "string" | "raw_string" => return true,
+            "field" | "struct" | "array" | "map" | "tuple" | "source_file" => return false,
+            _ => node = current.parent(),
+        }
+    }
+    false
+}
+
 pub async fn completions_for_field_path(
     content: &str,
     position: Position,
     top_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Option<Vec<CompletionItem>> {
+    // Внутри строки подсказывать нечего: незакрытая кавычка «съедает» остаток
+    // файла, и любой список был бы выдумкой.
+    if cursor_inside_string(content, position) {
+        return Some(Vec::new());
+    }
+
     let path = path_at_position(content, position)?;
     debug_log(&format!("путь: {path:?}"));
     let (last, enclosing) = path.split_last()?;
@@ -1111,6 +1191,33 @@ mod tests {
         let on_tuple = path_at_position(content, Position::new(5, 17)).expect("путь до кортежа");
         assert_eq!(
             on_tuple,
+            vec![
+                Step::Field("flags".into()),
+                Step::Field("target".into()),
+                Step::Element(0),
+            ]
+        );
+    }
+
+    /// Первое значение правила набрано без запятой: кортежа в дереве ещё нет
+    /// (парсер держит `( e` в ERROR), но позиция всё равно читается.
+    #[test]
+    fn tuple_element_is_found_before_the_comma() {
+        let content = "EffectTest(
+    flags: [
+        (
+            key: \"flag.ability_add\",
+            target: [
+                (
+                    e
+                ),
+            ],
+        ),
+    ],
+)";
+        let path = path_at_position(content, Position::new(6, 21)).expect("путь до правила");
+        assert_eq!(
+            path,
             vec![
                 Step::Field("flags".into()),
                 Step::Field("target".into()),
