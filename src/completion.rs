@@ -652,7 +652,36 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     }
     path.reverse();
 
+    // Значение ещё не набрано: курсор стоит за `mode:`, и узла-значения в дереве
+    // нет. Имя поля берём из текста слева — иначе путь обрывается и подсказки
+    // откатываются к списку полей структуры.
+    if let Some(name) = field_name_left_of_cursor(content, offset) {
+        if path.last() != Some(&Step::Field(name.clone())) {
+            path.push(Step::Field(name));
+        }
+    }
+
     (!path.is_empty()).then_some(path)
+}
+
+/// Имя поля, если курсор стоит сразу за его двоеточием (`mode: |`).
+fn field_name_left_of_cursor(content: &str, offset: usize) -> Option<String> {
+    let left = content.get(..offset)?;
+    let line = left.rsplit('\n').next()?;
+    let trimmed = line.trim_end();
+    let (name, _) = trimmed.rsplit_once(':')?;
+    let name = name.trim_end();
+    let name = name.rsplit(|c: char| c.is_whitespace()).next()?;
+
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Тип после шага пути: поле структуры или значение структуры-кортежа.
