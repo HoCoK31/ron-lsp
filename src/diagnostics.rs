@@ -632,6 +632,47 @@ async fn validate_enum_variant_with_fields(
     diagnostics
 }
 
+/// A value node checked against a primitive type: the tree-sitter kind is the
+/// evidence, since a map value has no field of its own.
+fn check_primitive_node(node: &tree_sitter::Node, expected: &str) -> Option<Diagnostic> {
+    let kind = node.kind();
+    let ok = match expected {
+        "String" | "&str" | "str" => matches!(kind, "string" | "raw_string"),
+        "f32" | "f64" => matches!(kind, "float" | "integer"),
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => kind == "integer",
+        "bool" => kind == "boolean",
+        "char" => kind == "char",
+        _ => return None,
+    };
+    if ok {
+        None
+    } else {
+        Some(Diagnostic {
+            range: crate::ts_utils::node_to_lsp_range(node),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("expected {expected}, got {kind}"),
+            ..Default::default()
+        })
+    }
+}
+
+/// `HashMap<K, V>` split into its two parameters, honouring nested generics.
+fn split_map_type(inner: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                return Some((inner[..index].trim(), inner[index + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// A node that has to name an enum variant.
 ///
 /// Tuple fields keep no name, so the RON-value checks — which look a value up by
@@ -720,6 +761,65 @@ async fn validate_field_value_node<'a>(
             ))
             .await;
             diagnostics.extend(elem_diags);
+        }
+        return Some(diagnostics);
+    }
+
+    // Map values: `HashMap<K, V>` (optionally behind `Option<…>`). A value has no
+    // field of its own, so a primitive is judged by its node kind and a custom type
+    // by recursing with the value's declared type.
+    let unwrapped = field_type_normalized
+        .strip_prefix("Option<")
+        .filter(|inner| inner.ends_with('>'))
+        .map(|inner| &inner[..inner.len() - 1])
+        .unwrap_or(field_type_normalized.as_str());
+    for wrapper in ["HashMap<", "BTreeMap<"] {
+        let Some(inner) = extract_inner_type(unwrapped, wrapper) else {
+            continue;
+        };
+        let (_key_type, value_type) = split_map_type(&inner)?;
+        if value_node.kind() != "map" {
+            return None;
+        }
+
+        let value_custom = analyzer.get_type_info(value_type).await;
+        // An enum whose variants carry data takes any RON value inside them; only a
+        // unit-only enum can be judged by its variant name.
+        if let Some(info) = &value_custom {
+            if let TypeKind::Enum(variants) = &info.kind {
+                if variants.iter().any(|variant| !variant.fields.is_empty()) {
+                    return Some(Vec::new());
+                }
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        for entry in crate::ts_utils::named_children(value_node) {
+            let children = crate::ts_utils::named_children(&entry);
+            let Some(value) = children.get(1) else {
+                continue;
+            };
+            if is_primitive_type(value_type) {
+                if let Some(diag) = check_primitive_node(value, value_type) {
+                    diagnostics.push(diag);
+                }
+                continue;
+            }
+            if let Some(info) = &value_custom {
+                if let TypeKind::Enum(variants) = &info.kind {
+                    if let Some(diag) = check_enum_variant_node(value, content, info, variants) {
+                        diagnostics.push(diag);
+                    }
+                    continue;
+                }
+            }
+            if let Some(value_diags) = Box::pin(validate_field_value_node(
+                value, content, value_type, analyzer,
+            ))
+            .await
+            {
+                diagnostics.extend(value_diags);
+            }
         }
         return Some(diagnostics);
     }
@@ -3061,6 +3161,42 @@ PostReference(Post(
                 .iter()
                 .any(|d| d.message.contains("expected 2 values")),
             "{diagnostics:#?}"
+        );
+    }
+
+    /// Map values have no field of their own: a primitive is judged by the node kind,
+    /// so `Option<HashMap<String, String>>` has to reject a bare number.
+    #[tokio::test]
+    async fn test_map_values_are_validated() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "EffectLike".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "stats".to_string(),
+                type_name: "Option<HashMap<String, String>>".to_string(),
+                docs: None,
+                line: None,
+                column: None,
+                has_default: false,
+            }]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        let good = "EffectLike(\n    stats: {\n        \"stat.a\": \"2.0\",\n    },\n)";
+        let diagnostics = validate_ron_with_analyzer(good, &type_info, analyzer.clone()).await;
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let bad = "EffectLike(\n    stats: {\n        \"stat.a\": 0.5,\n    },\n)";
+        let diagnostics = validate_ron_with_analyzer(bad, &type_info, analyzer).await;
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("expected String"),
+            "{:?}",
+            diagnostics[0].message
         );
     }
 }
