@@ -628,7 +628,9 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
 
     let mut path = Vec::new();
     let mut current = Some(cursor);
+    let mut chain = Vec::new();
     while let Some(node) = current {
+        chain.push(node.kind().to_string());
         match node.kind() {
             "field" => {
                 if let Some(name) = ts_utils::field_name(&node, content) {
@@ -639,9 +641,12 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
                 // Номер значения, внутри которого стоит курсор: правило цели
                 // `(Effect, Up)` — структура-кортеж, её поля позиционные.
                 let values = ts_utils::named_children(&node);
+                // Курсор может стоять на самом кортеже (`( |` или `Effect, |`):
+                // тогда позиция — первый сын, начинающийся не раньше курсора.
                 if let Some(index) = values
                     .iter()
                     .position(|value| node_is_ancestor_or_self(*value, cursor))
+                    .or_else(|| values.iter().position(|value| value.start_byte() >= offset))
                 {
                     path.push(Step::Element(index));
                 }
@@ -651,6 +656,7 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
         current = node.parent();
     }
     path.reverse();
+    debug_log(&format!("цепочка узлов: {chain:?}"));
 
     // Значение ещё не набрано: курсор стоит за `mode:`, и узла-значения в дереве
     // нет. Имя поля берём из текста слева — иначе путь обрывается и подсказки
@@ -690,18 +696,50 @@ async fn step_type(
     current: &TypeInfo,
     step: &Step,
 ) -> Option<TypeInfo> {
-    // Значение кортежа берётся по позиции: как сканер назвал поля структуры-кортежа
-    // (`0`/`1` или иначе) — не важно.
-    let type_name = match step {
-        Step::Field(name) => current
-            .fields()?
-            .iter()
-            .find(|field| &field.name == name)?
-            .type_name
-            .clone(),
-        Step::Element(index) => current.fields()?.get(*index)?.type_name.clone(),
-    };
+    let type_name = field_type_name(analyzer, current, step).await?;
     analyzer.get_type_info(&unwrap_wrapper(&type_name)).await
+}
+
+/// Имя типа, который записан в поле (или в позиции кортежа) текущего типа.
+async fn field_type_name(
+    analyzer: &Arc<RustAnalyzer>,
+    current: &TypeInfo,
+    step: &Step,
+) -> Option<String> {
+    // Массив в RON пишется как есть: `target: [ (Effect, Up) ]` — шаг пути
+    // относится к элементу массива, поэтому обёртки (`Vec<T>`, `Option<T>`)
+    // снимаются до применения шага.
+    let base = analyzer
+        .get_type_info(&unwrap_wrapper(&current.name))
+        .await
+        .unwrap_or_else(|| current.clone());
+
+    match step {
+        Step::Field(name) => Some(
+            base.fields()?
+                .iter()
+                .find(|field| &field.name == name)?
+                .type_name
+                .clone(),
+        ),
+        Step::Element(index) => Some(base.fields()?.get(*index)?.type_name.clone()),
+    }
+}
+
+/// Временный журнал для разбора подсказок: включается `RON_LSP_DEBUG_COMPLETION`.
+fn debug_log(message: &str) {
+    if std::env::var_os("RON_LSP_DEBUG_COMPLETION").is_none() {
+        return;
+    }
+    let path = std::env::temp_dir().join("ron-lsp-completion.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 /// Подсказки для значения, найденного по пути от курсора вверх.
@@ -719,35 +757,64 @@ pub async fn completions_for_field_path(
     analyzer: Arc<RustAnalyzer>,
 ) -> Option<Vec<CompletionItem>> {
     let path = path_at_position(content, position)?;
+    debug_log(&format!("путь: {path:?}"));
     let (last, enclosing) = path.split_last()?;
 
     let mut current = analyzer.get_type_info(top_type).await?;
+    debug_log(&format!("корень {top_type} -> {}", current.name));
     for step in enclosing {
         match step_type(&analyzer, &current, step).await {
             Some(next) => {
+                debug_log(&format!("  {step:?} -> {}", next.name));
                 current = next;
             }
             None => {
+                let fields: Vec<String> = current
+                    .fields()
+                    .map(|list| list.iter().map(|field| field.name.clone()).collect())
+                    .unwrap_or_default();
+                debug_log(&format!(
+                    "  {step:?} -> РАЗРЫВ (текущий {}: {fields:?})",
+                    current.name
+                ));
                 return None;
             }
         }
     }
 
-    let inner = step_type(&analyzer, &current, last).await?;
-    let TypeKind::Enum(variants) = &inner.kind else {
+    // Тип последнего шага известен: отвечаем сами — «все типы проекта» здесь
+    // были бы шумом. Перечисление — варианты, структура — её поля, примитив
+    // (`String`, числа) — ничего.
+    let Some(type_name) = field_type_name(&analyzer, &current, last).await else {
+        debug_log(&format!("  последний {last:?} -> поля нет"));
         return None;
     };
+    let Some(inner) = analyzer.get_type_info(&unwrap_wrapper(&type_name)).await else {
+        return Some(Vec::new());
+    };
 
-    Some(
-        variants
-            .iter()
-            .map(|variant| CompletionItem {
-                label: variant.name.clone(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                ..Default::default()
-            })
-            .collect(),
-    )
+    match &inner.kind {
+        TypeKind::Enum(variants) => Some(
+            variants
+                .iter()
+                .map(|variant| CompletionItem {
+                    label: variant.name.clone(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        TypeKind::Struct(fields) => Some(
+            fields
+                .iter()
+                .map(|field| CompletionItem {
+                    label: field.name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1038,5 +1105,17 @@ mod tests {
                 .expect("варианты цели");
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["Any", "Creature", "Item", "Effect"]);
+
+        // Значение ещё не набрано: курсор стоит на самом кортеже — позиция берётся
+        // по первому сыну, который начинается не раньше курсора.
+        let on_tuple = path_at_position(content, Position::new(5, 17)).expect("путь до кортежа");
+        assert_eq!(
+            on_tuple,
+            vec![
+                Step::Field("flags".into()),
+                Step::Field("target".into()),
+                Step::Element(0),
+            ]
+        );
     }
 }
