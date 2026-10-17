@@ -651,7 +651,7 @@ fn check_primitive_node(node: &tree_sitter::Node, expected: &str) -> Option<Diag
         Some(Diagnostic {
             range: crate::ts_utils::node_to_lsp_range(node),
             severity: Some(DiagnosticSeverity::ERROR),
-            message: format!("expected {expected}, got {kind}"),
+            message: format!("Type mismatch: expected {expected}, got {kind}"),
             ..Default::default()
         })
     }
@@ -824,7 +824,16 @@ async fn validate_field_value_node<'a>(
         return Some(diagnostics);
     }
 
-    if is_primitive_type(&field_type_normalized) || is_std_generic_type(&field_type_normalized) {
+    // A primitive is judged by its node kind right here: a nested struct's fields
+    // never reach the RON-value fallback, which only runs for top-level fields.
+    if is_primitive_type(&field_type_normalized) {
+        return Some(
+            check_primitive_node(value_node, &field_type_normalized)
+                .into_iter()
+                .collect(),
+        );
+    }
+    if is_std_generic_type(&field_type_normalized) {
         return None;
     }
 
@@ -3195,6 +3204,52 @@ PostReference(Post(
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert!(
             diagnostics[0].message.contains("expected String"),
+            "{:?}",
+            diagnostics[0].message
+        );
+    }
+
+    /// Primitive fields of nested structs: they never reach the RON-value fallback,
+    /// so the node kind has to be checked in place — `count: h` is not a u32.
+    #[tokio::test]
+    async fn test_nested_primitive_fields_are_validated() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let type_of = |name: &str, kind: TypeKind| TypeInfo {
+            name: name.to_string(),
+            kind,
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        analyzer
+            .insert_type_for_test(type_of(
+                "Slot",
+                TypeKind::Struct(vec![field("kind", "String"), field("count", "u32")]),
+            ))
+            .await;
+        let type_info = type_of("Limb", TypeKind::Struct(vec![field("slots", "Vec<Slot>")]));
+
+        let good = "Limb(slots: [(kind: \"slot.a\", count: 2)])";
+        let diagnostics = validate_ron_with_analyzer(good, &type_info, analyzer.clone()).await;
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let bad = "Limb(slots: [(kind: \"slot.a\", count: h)])";
+        let diagnostics = validate_ron_with_analyzer(bad, &type_info, analyzer).await;
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("expected u32, got identifier"),
             "{:?}",
             diagnostics[0].message
         );
