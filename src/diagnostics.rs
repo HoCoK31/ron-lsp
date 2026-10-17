@@ -632,6 +632,37 @@ async fn validate_enum_variant_with_fields(
     diagnostics
 }
 
+/// A node that has to name an enum variant.
+///
+/// Tuple fields keep no name, so the RON-value checks — which look a value up by
+/// field name — cannot judge them; the variant has to be checked on the node.
+/// Reports an unknown name, or a value that is not a variant at all.
+fn check_enum_variant_node(
+    node: &tree_sitter::Node,
+    content: &str,
+    enum_info: &TypeInfo,
+    variants: &[EnumVariant],
+) -> Option<Diagnostic> {
+    match crate::ts_utils::extract_enum_variant(node, content) {
+        Some(variant) if variants.iter().any(|known| known.name == variant.name) => None,
+        Some(variant) => Some(Diagnostic {
+            range: crate::ts_utils::node_to_lsp_range(node),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!(
+                "Unknown variant '{}' for enum '{}'",
+                variant.name, enum_info.name
+            ),
+            ..Default::default()
+        }),
+        None => Some(Diagnostic {
+            range: crate::ts_utils::node_to_lsp_range(node),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("expected {}, got {}", enum_info.name, node.kind()),
+            ..Default::default()
+        }),
+    }
+}
+
 /// Validate a single field's value node against its declared Rust type.
 ///
 /// This is the single place that decides how to recurse into generic wrappers
@@ -673,28 +704,10 @@ async fn validate_field_value_node<'a>(
         let mut diagnostics = Vec::new();
         for elem_node in crate::ts_utils::array_value_children(value_node) {
             if let TypeKind::Enum(variants) = &inner_type_info.kind {
-                // The variant name is the one thing an element can be judged by here.
-                match crate::ts_utils::extract_enum_variant(&elem_node, content) {
-                    Some(variant) if variants.iter().any(|known| known.name == variant.name) => {}
-                    Some(variant) => diagnostics.push(Diagnostic {
-                        range: crate::ts_utils::node_to_lsp_range(&elem_node),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!(
-                            "Unknown variant '{}' for enum '{}'",
-                            variant.name, inner_type_info.name
-                        ),
-                        ..Default::default()
-                    }),
-                    None => diagnostics.push(Diagnostic {
-                        range: crate::ts_utils::node_to_lsp_range(&elem_node),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!(
-                            "expected {}, got {}",
-                            inner_type_info.name,
-                            elem_node.kind()
-                        ),
-                        ..Default::default()
-                    }),
+                if let Some(diag) =
+                    check_enum_variant_node(&elem_node, content, &inner_type_info, variants)
+                {
+                    diagnostics.push(diag);
                 }
                 continue;
             }
@@ -746,6 +759,50 @@ async fn validate_node_with_type_info<'a>(
     }
 
     match &type_info.kind {
+        TypeKind::Struct(fields) if is_tuple_struct(fields) => {
+            // A tuple struct keeps its fields positional ("0", "1", …), so the value
+            // is a tuple (or an unnamed struct) and each field is matched by position.
+            let values = match node.kind() {
+                "tuple" => ts_utils::named_children(node),
+                "struct" => ts_utils::struct_values(node, content),
+                _ => Vec::new(),
+            };
+            if values.len() != fields.len() {
+                diagnostics.push(Diagnostic {
+                    range: ts_utils::node_to_lsp_range(node),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!(
+                        "expected {} values for tuple struct '{}', got {}",
+                        fields.len(),
+                        type_info.name,
+                        values.len()
+                    ),
+                    ..Default::default()
+                });
+            }
+            for (value, field) in values.iter().zip(fields) {
+                if let Some(field_info) = analyzer.get_type_info(&field.type_name).await {
+                    if let TypeKind::Enum(variants) = &field_info.kind {
+                        if let Some(diag) =
+                            check_enum_variant_node(value, content, &field_info, variants)
+                        {
+                            diagnostics.push(diag);
+                        }
+                        continue;
+                    }
+                }
+                let field_diags = Box::pin(validate_field_value_node(
+                    value,
+                    content,
+                    &field.type_name,
+                    analyzer,
+                ))
+                .await;
+                if let Some(field_diags) = field_diags {
+                    diagnostics.extend(field_diags);
+                }
+            }
+        }
         TypeKind::Struct(fields) => {
             // Validate struct fields
             if node.kind() == "struct" {
@@ -1011,6 +1068,15 @@ fn extract_map_from_value(value: &Value) -> Option<&ron::Map> {
         Value::Map(map) => Some(map),
         _ => None,
     }
+}
+
+/// A struct whose fields are positional: their names are the indices, as the
+/// analyzer writes them ("0", "1", …).
+fn is_tuple_struct(fields: &[FieldInfo]) -> bool {
+    !fields.is_empty()
+        && fields
+            .iter()
+            .all(|field| field.name.parse::<usize>().is_ok())
 }
 
 /// Check if a type is a primitive type (not a custom enum/struct)
@@ -2913,6 +2979,88 @@ PostReference(Post(
             diagnostics[0].message.contains("bogus"),
             "the message should name the variant, got: {:?}",
             diagnostics[0].message
+        );
+    }
+
+    /// Tuple-struct fields are positional: an element of `Vec<FlagReach>` is a tuple,
+    /// its fields have no names, and the enum inside has to be judged on the node.
+    #[tokio::test]
+    async fn test_tuple_struct_fields_are_validated() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let variant = |name: &str| EnumVariant {
+            name: name.to_string(),
+            fields: vec![],
+            docs: None,
+            line: None,
+            column: None,
+        };
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let type_of = |name: &str, kind: TypeKind| TypeInfo {
+            name: name.to_string(),
+            kind,
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        analyzer
+            .insert_type_for_test(type_of(
+                "FlagTarget",
+                TypeKind::Enum(vec![
+                    variant("Any"),
+                    variant("Creature"),
+                    variant("Item"),
+                    variant("Terrain"),
+                    variant("Effect"),
+                ]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "FlagDirection",
+                TypeKind::Enum(vec![variant("Up"), variant("Down")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "FlagReach",
+                TypeKind::Struct(vec![field("0", "FlagTarget"), field("1", "FlagDirection")]),
+            ))
+            .await;
+        let type_info = type_of(
+            "FlagUse",
+            TypeKind::Struct(vec![field("target", "Vec<FlagReach>")]),
+        );
+
+        let good = "FlagUse(\n    target: [\n        (Effect, Up),\n    ],\n)";
+        let diagnostics = validate_ron_with_analyzer(good, &type_info, analyzer.clone()).await;
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let typo = "FlagUse(\n    target: [\n        (Effeect, Up),\n    ],\n)";
+        let diagnostics = validate_ron_with_analyzer(typo, &type_info, analyzer.clone()).await;
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("Effeect"),
+            "{:?}",
+            diagnostics[0].message
+        );
+
+        let short = "FlagUse(\n    target: [\n        (Effect),\n    ],\n)";
+        let diagnostics = validate_ron_with_analyzer(short, &type_info, analyzer).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected 2 values")),
+            "{diagnostics:#?}"
         );
     }
 }
