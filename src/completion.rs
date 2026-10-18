@@ -738,7 +738,13 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
     // node in the tree. The field name is taken from the text on the left — otherwise
     // the path breaks and the completions fall back to the struct's field list.
     if let Some(name) = field_name_left_of_cursor(content, offset) {
-        if path.last() != Some(&Step::Field(name.clone())) {
+        // The name may already stand in the path: inside a payload written on the same
+        // line the text left of the cursor names the outer field (`target: First...([…`),
+        // and a second step would break the resolution.
+        let known = path
+            .iter()
+            .any(|step| matches!(step, Step::Field(field) if *field == name));
+        if !known {
             path.push(Step::Field(name));
         }
     }
@@ -1216,6 +1222,27 @@ mod tests {
             .expect("completions for the enum");
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["Alpha", "Beta"]);
+    }
+
+    /// A payload written on one line: the cursor inside it is a variant field, not a
+    /// field of the document type - the path must not gain a step from the text left
+    /// of the cursor.
+    #[test]
+    fn single_line_payload_path_resolves() {
+        let content = "Effect(
+                target: FirstParentOf([Cre]),
+)";
+        let path = path_at_position(content, Position::new(1, 42)).expect("path");
+        assert_eq!(
+            path,
+            vec![
+                Step::Field("target".into()),
+                Step::Variant {
+                    name: "FirstParentOf".into(),
+                    index: 0,
+                },
+            ]
+        );
     }
 
     /// A variant payload is a list of values: the cursor inside `Variant([ ... ])` is a
