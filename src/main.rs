@@ -138,22 +138,23 @@ impl Backend {
     /// Called after the model or the configuration changed: both decide which type a
     /// file is checked against, and a cached annotation would keep the old answer.
     async fn republish_open_documents(&self) {
-        let open: Vec<(String, String, Option<String>)> = {
+        let open: Vec<(String, String)> = {
             let documents = self.documents.read().await;
             documents
                 .iter()
-                .map(|(uri, doc)| {
-                    (
-                        uri.clone(),
-                        doc.content.clone(),
-                        doc.type_annotation.clone(),
-                    )
-                })
+                .map(|(uri, doc)| (uri.clone(), doc.content.clone()))
                 .collect()
         };
         let count = open.len();
 
-        for (uri, content, annotation) in open {
+        for (uri, content) in open {
+            // The mapping may have changed together with the configuration, so the
+            // annotation is taken from it again rather than from the copy cached when
+            // the document was opened.
+            let annotation = match Url::parse(&uri) {
+                Ok(url) => self.get_type_annotation(&content, &url).await,
+                Err(_) => None,
+            };
             self.publish_diagnostics(&uri, &content, annotation.as_deref())
                 .await;
         }
