@@ -124,7 +124,7 @@ impl Backend {
 
     /// Watch the two things that can change the model behind an annotation: the
     /// mapping file and the Rust sources that declare the types.
-    /// Rust sources changed, so the analyzer's snapshot of the workspace is stale:
+    /// Re-checked {} open file(s) against the current model and mapping.
     /// types, their fields, enum variants and custom deserializers all come from
     /// them. Re-scan, then re-validate every open document — an edit in `src/` has to
     /// show up in a RON file without the user restarting the language server.
