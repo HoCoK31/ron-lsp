@@ -1,4 +1,4 @@
-use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{RustAnalyzer, TypeInfo, TypeKind};
 use crate::tree_sitter_parser;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
@@ -557,7 +557,7 @@ async fn generate_value_completions_by_type(
 }
 
 /// Unwraps `Vec<…>`, `Option<…>`, `Box<…>` wrappers down to the payload type.
-fn unwrap_wrapper(type_name: &str) -> String {
+pub(crate) fn unwrap_wrapper(type_name: &str) -> String {
     let mut current = type_name.replace(' ', "");
     loop {
         let mut unwrapped = None;
@@ -816,39 +816,59 @@ fn cursor_inside_string(content: &str, position: Position) -> bool {
     false
 }
 
-/// Поле под курсором, найденное по дереву: владелец поля и само поле.
+/// Поле под курсором, найденное по дереву.
 ///
 /// Путь берётся от курсора вверх (как для подсказок) и разрешается вниз от типа
 /// документа, поэтому поле находится и внутри массивов и кортежей — туда
 /// навигация по контекстам аннотаций не спускается.
+pub(crate) struct FieldAtCursor {
+    /// Тип-владелец поля, полным именем.
+    pub owner: String,
+    /// Имя поля; у позиции кортежа — как её назвал сканер (`0`, `1`).
+    pub name: String,
+    /// Тип поля строкой, как объявлен.
+    pub type_name: String,
+    /// Док-комментарий поля из модели.
+    pub docs: Option<String>,
+}
+
+/// Ищет поле под курсором по дереву (см. [`FieldAtCursor`]).
 pub(crate) async fn field_at_position(
     content: &str,
     position: Position,
     top_type: &str,
     analyzer: Arc<RustAnalyzer>,
-) -> Option<(TypeInfo, FieldInfo)> {
+) -> Option<FieldAtCursor> {
     let path = path_at_position(content, position)?;
     let (last, enclosing) = path.split_last()?;
-    let Step::Field(name) = last else {
-        return None;
-    };
 
     let mut current = analyzer.get_type_info(top_type).await?;
     for step in enclosing {
         current = step_type(&analyzer, &current, step).await?;
     }
 
+    // Владелец поля: обёртки (`Vec<T>`) снимаются — позиция кортежа живёт в
+    // самой структуре, а не в её векторе.
     let owner = analyzer
         .get_type_info(&unwrap_wrapper(&current.name))
         .await
         .unwrap_or(current);
-    let field = owner
-        .fields()?
-        .iter()
-        .find(|field| field.name == *name)?
-        .clone();
 
-    Some((owner, field))
+    let field = match last {
+        Step::Field(name) => owner
+            .fields()?
+            .iter()
+            .find(|field| &field.name == name)?
+            .clone(),
+        Step::Element(index) => owner.fields()?.get(*index)?.clone(),
+    };
+
+    Some(FieldAtCursor {
+        owner: owner.name.clone(),
+        name: field.name.clone(),
+        type_name: field.type_name.clone(),
+        docs: field.docs.clone(),
+    })
 }
 
 /// Completions for the value found by the path from the cursor upwards.

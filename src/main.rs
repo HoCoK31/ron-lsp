@@ -775,35 +775,7 @@ impl LanguageServer for Backend {
 
                 // Case 2: Hovering over a variant name
                 if let Some(variant) = type_info.find_variant(&word) {
-                    let mut hover_text = format!(
-                        "```rust\nenum {}\n```\n\n**Variant:** `{}`",
-                        type_info.name.split("::").last().unwrap_or(&type_info.name),
-                        variant.name
-                    );
-
-                    if let Some(ref docs) = variant.docs {
-                        hover_text.push_str(&format!("\n\n{}", docs));
-                    }
-
-                    if !variant.fields.is_empty() {
-                        hover_text.push_str("\n\n**Fields:**\n");
-                        for field in &variant.fields {
-                            hover_text
-                                .push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
-                            if let Some(ref field_docs) = field.docs {
-                                hover_text.push_str(&format!(" - {}", field_docs));
-                            }
-                            hover_text.push('\n');
-                        }
-                    }
-
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: hover_text,
-                        }),
-                        range: None,
-                    }));
+                    return Ok(Some(self.variant_hover(&type_info, variant)));
                 }
 
                 // Case 3: Hovering over the type name itself (or check if word matches the current type)
@@ -873,7 +845,7 @@ impl LanguageServer for Backend {
         // Поле по дереву: контексты аннотаций не спускаются в массивы и кортежи,
         // поэтому `formula` внутри `damage: [ ( … ) ]` так не находится.
         if let Some(type_path) = top_type.as_deref() {
-            if let Some((owner, field)) = completion::field_at_position(
+            if let Some(found) = completion::field_at_position(
                 &content,
                 position,
                 type_path,
@@ -881,7 +853,16 @@ impl LanguageServer for Backend {
             )
             .await
             {
-                let owner_name = owner.name.split("::").last().unwrap_or(&owner.name);
+                // Слово может быть вариантом типа поля: `Dot` в `delivery: [ … ]`,
+                // `Effect` и `Up` в кортеже правила цели.
+                let field_type = completion::unwrap_wrapper(&found.type_name);
+                if let Some(info) = self.rust_analyzer.get_type_info(&field_type).await {
+                    if let Some(variant) = info.find_variant(&word) {
+                        return Ok(Some(self.variant_hover(&info, variant)));
+                    }
+                }
+
+                let owner_name = found.owner.split("::").last().unwrap_or(&found.owner);
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -893,9 +874,9 @@ impl LanguageServer for Backend {
 {}
 
 _поле `{}`_",
-                            field.name,
-                            field.type_name,
-                            field.docs.as_deref().unwrap_or(""),
+                            found.name,
+                            found.type_name,
+                            found.docs.as_deref().unwrap_or(""),
                             owner_name
                         ),
                     }),
@@ -1248,6 +1229,42 @@ impl Backend {
 
     /// Navigate through nested type contexts to find the innermost type
     /// This is used by goto_definition, hover, and completion
+    /// Всплывающая подсказка по варианту перечисления.
+    fn variant_hover(
+        &self,
+        type_info: &rust_analyzer::TypeInfo,
+        variant: &rust_analyzer::EnumVariant,
+    ) -> Hover {
+        let mut hover_text = format!(
+            "```rust\nenum {}\n```\n\n**Variant:** `{}`",
+            type_info.name.split("::").last().unwrap_or(&type_info.name),
+            variant.name
+        );
+
+        if let Some(ref docs) = variant.docs {
+            hover_text.push_str(&format!("\n\n{}", docs));
+        }
+
+        if !variant.fields.is_empty() {
+            hover_text.push_str("\n\n**Fields:**\n");
+            for field in &variant.fields {
+                hover_text.push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
+                if let Some(ref field_docs) = field.docs {
+                    hover_text.push_str(&format!(" - {}", field_docs));
+                }
+                hover_text.push('\n');
+            }
+        }
+
+        Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: hover_text,
+            }),
+            range: None,
+        }
+    }
+
     async fn navigate_to_innermost_type(
         &self,
         top_level_type_path: &str,
