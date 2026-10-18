@@ -714,6 +714,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
+        let top_type = type_path.clone();
         if let Some(type_path) = type_path {
             // Use cached context lookup
             let contexts = self.get_type_contexts(&uri, position, &content).await;
@@ -866,6 +867,40 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
+            }
+        }
+
+        // Поле по дереву: контексты аннотаций не спускаются в массивы и кортежи,
+        // поэтому `formula` внутри `damage: [ ( … ) ]` так не находится.
+        if let Some(type_path) = top_type.as_deref() {
+            if let Some((owner, field)) = completion::field_at_position(
+                &content,
+                position,
+                type_path,
+                self.rust_analyzer.clone(),
+            )
+            .await
+            {
+                let owner_name = owner.name.split("::").last().unwrap_or(&owner.name);
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!(
+                            "```rust
+{}: {}
+```
+
+{}
+
+_поле `{}`_",
+                            field.name,
+                            field.type_name,
+                            field.docs.as_deref().unwrap_or(""),
+                            owner_name
+                        ),
+                    }),
+                    range: None,
+                }));
             }
         }
 
