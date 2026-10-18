@@ -62,8 +62,8 @@ pub fn format_ron(content: &str) -> String {
         return content.to_string();
     }
 
-    // Файл заканчивается одним переводом строки: без него редакторы и git
-    // считают файл изменённым после каждого форматирования.
+    // A file ends with a single newline: without it editors and git treat the file
+    // as changed after every format.
     let mut formatted = result.trim_end().to_string();
     formatted.push('\n');
     formatted
@@ -393,20 +393,20 @@ fn format_tuple(
 #[cfg(test)]
 mod tests {
 
-    /// Форматирование без завершающего перевода строки: раскладку сравнивать
-    /// удобнее без него, а сам перевод проверяет отдельный тест.
+    /// Formatting without the trailing newline: layouts are easier to compare that
+    /// way, and the newline itself has its own test.
     fn formatted(input: &str) -> String {
         format_ron(input).trim_end().to_string()
     }
 
-    /// Файл заканчивается одним переводом строки: иначе редакторы и git считают
-    /// файл изменённым после каждого форматирования.
+    /// A file ends with a single newline: otherwise editors and git treat the file
+    /// as changed after every format.
     #[test]
     fn output_ends_with_a_single_newline() {
         let once = format_ron("Config(roles: [1])");
-        assert!(once.ends_with('\n'), "хвост: {once:?}");
-        assert!(!once.ends_with("\n\n"), "ровно один: {once:?}");
-        assert_eq!(format_ron("Config(roles: [1])\n\n\n"), once, "идемпотентно");
+        assert!(once.ends_with('\n'), "trailing: {once:?}");
+        assert!(!once.ends_with("\n\n"), "exactly one: {once:?}");
+        assert_eq!(format_ron("Config(roles: [1])\n\n\n"), once, "idempotent");
     }
 
     use super::*;

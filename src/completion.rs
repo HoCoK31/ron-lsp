@@ -816,23 +816,23 @@ fn cursor_inside_string(content: &str, position: Position) -> bool {
     false
 }
 
-/// Поле под курсором, найденное по дереву.
+/// A field under the cursor, found through the syntax tree.
 ///
-/// Путь берётся от курсора вверх (как для подсказок) и разрешается вниз от типа
-/// документа, поэтому поле находится и внутри массивов и кортежей — туда
-/// навигация по контекстам аннотаций не спускается.
+/// The path is collected upwards from the cursor, as for completions, and resolved
+/// downwards from the document type, so a field inside arrays and tuples is found
+/// too — the annotation contexts never descend there.
 pub(crate) struct FieldAtCursor {
-    /// Тип-владелец поля, полным именем.
+    /// The owning type, by full name.
     pub owner: String,
-    /// Имя поля; у позиции кортежа — как её назвал сканер (`0`, `1`).
+    /// The field name; a tuple position keeps the name the scanner gave it (`0`, `1`).
     pub name: String,
-    /// Тип поля строкой, как объявлен.
+    /// The field type as declared, as a string.
     pub type_name: String,
-    /// Док-комментарий поля из модели.
+    /// The field's doc comment from the model.
     pub docs: Option<String>,
 }
 
-/// Ищет поле под курсором по дереву (см. [`FieldAtCursor`]).
+/// Finds the field under the cursor through the tree (see [`FieldAtCursor`]).
 pub(crate) async fn field_at_position(
     content: &str,
     position: Position,
@@ -847,8 +847,8 @@ pub(crate) async fn field_at_position(
         current = step_type(&analyzer, &current, step).await?;
     }
 
-    // Владелец поля: обёртки (`Vec<T>`) снимаются — позиция кортежа живёт в
-    // самой структуре, а не в её векторе.
+    // Wrappers (`Vec<T>`) are stripped: a tuple position lives in the struct
+    // itself, not in its vector.
     let owner = analyzer
         .get_type_info(&unwrap_wrapper(&current.name))
         .await

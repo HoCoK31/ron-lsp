@@ -130,7 +130,14 @@ impl Backend {
     /// show up in a RON file without the user restarting the language server.
     async fn rust_sources_changed(&self) {
         self.rust_analyzer.scan_workspace().await;
+        self.republish_open_documents().await;
+    }
 
+    /// Re-reads the mapping for every open document and publishes diagnostics again.
+    ///
+    /// Called after the model or the configuration changed: both decide which type a
+    /// file is checked against, and a cached annotation would keep the old answer.
+    async fn republish_open_documents(&self) {
         let open: Vec<(String, String, Option<String>)> = {
             let documents = self.documents.read().await;
             documents
@@ -222,6 +229,10 @@ impl Backend {
                 .log_message(MessageType::INFO, "New configuration applied")
                 .await;
         }
+
+        // The mapping itself changed, so every open document must be checked against
+        // the new type before its diagnostics make sense again.
+        self.republish_open_documents().await;
     }
 
     /// Get type contexts with caching
@@ -355,10 +366,9 @@ impl LanguageServer for Backend {
             },
         );
 
-        // Модель могла измениться снаружи редактора: к открытию документа
-        // rust-analyzer уже переиндексировал файлы, поэтому скан здесь читает
-        // свежие данные — в отличие от события наблюдателя, которое приходит
-        // раньше готовности анализатора и потому может застать старую модель.
+        // The model may have changed outside the editor: by the time a document is
+        // opened the analyzer has re-indexed the files, so this scan reads fresh data
+        // — unlike the watcher event, which can arrive before the analyzer is ready.
         if type_annotation.is_some() {
             self.rust_analyzer.scan_workspace().await;
         }
@@ -424,8 +434,20 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_save(&self, _params: DidSaveTextDocumentParams) {
-        // No-op for now
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        // Clients are not required to report watched files, so the configuration is
+        // re-read when the editor saves it: the mapping then applies immediately,
+        // without restarting the server.
+        let is_config = params
+            .text_document
+            .uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name == CONFIG_FILE_NAME))
+            .unwrap_or(false);
+        if is_config {
+            self.config_file_changed().await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -850,8 +872,8 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Поле по дереву: контексты аннотаций не спускаются в массивы и кортежи,
-        // поэтому `formula` внутри `damage: [ ( … ) ]` так не находится.
+        // Field through the tree: annotation contexts never descend into arrays and
+        // tuples, so a field inside a list of records is not found that way.
         if let Some(type_path) = top_type.as_deref() {
             if let Some(found) = completion::field_at_position(
                 &content,
@@ -861,8 +883,8 @@ impl LanguageServer for Backend {
             )
             .await
             {
-                // Слово может быть вариантом типа поля: `Dot` в `delivery: [ … ]`,
-                // `Effect` и `Up` в кортеже правила цели.
+                // The word may be a variant of the field's type: it is offered even
+                // when it sits inside a list or a tuple rule.
                 let field_type = completion::unwrap_wrapper(&found.type_name);
                 if let Some(info) = self.rust_analyzer.get_type_info(&field_type).await {
                     if let Some(variant) = info.find_variant(&word) {
@@ -881,7 +903,7 @@ impl LanguageServer for Backend {
 
 {}
 
-_поле `{}`_",
+_field of `{}`_",
                             found.name,
                             found.type_name,
                             found.docs.as_deref().unwrap_or(""),
@@ -1084,8 +1106,8 @@ _поле `{}`_",
                     }
                 }
 
-                // Format the selected text. Это фрагмент, а не файл: хвостовой
-                // перевод строки не добавляем, иначе вставится лишняя пустая строка.
+                // Selected text, not a file: no trailing newline, or an extra empty
+                // line would be inserted.
                 let formatted = Backend::format_ron(&selected_text).trim_end().to_string();
 
                 if formatted != selected_text {
@@ -1237,7 +1259,7 @@ impl Backend {
 
     /// Navigate through nested type contexts to find the innermost type
     /// This is used by goto_definition, hover, and completion
-    /// Всплывающая подсказка по варианту перечисления.
+    /// The hover text for an enum variant.
     fn variant_hover(
         &self,
         type_info: &rust_analyzer::TypeInfo,
