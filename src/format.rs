@@ -62,7 +62,11 @@ pub fn format_ron(content: &str) -> String {
         return content.to_string();
     }
 
-    result.trim_end().to_string()
+    // Файл заканчивается одним переводом строки: без него редакторы и git
+    // считают файл изменённым после каждого форматирования.
+    let mut formatted = result.trim_end().to_string();
+    formatted.push('\n');
+    formatted
 }
 
 /// Format a single node recursively
@@ -388,6 +392,23 @@ fn format_tuple(
 
 #[cfg(test)]
 mod tests {
+
+    /// Форматирование без завершающего перевода строки: раскладку сравнивать
+    /// удобнее без него, а сам перевод проверяет отдельный тест.
+    fn formatted(input: &str) -> String {
+        format_ron(input).trim_end().to_string()
+    }
+
+    /// Файл заканчивается одним переводом строки: иначе редакторы и git считают
+    /// файл изменённым после каждого форматирования.
+    #[test]
+    fn output_ends_with_a_single_newline() {
+        let once = format_ron("Config(roles: [1])");
+        assert!(once.ends_with('\n'), "хвост: {once:?}");
+        assert!(!once.ends_with("\n\n"), "ровно один: {once:?}");
+        assert_eq!(format_ron("Config(roles: [1])\n\n\n"), once, "идемпотентно");
+    }
+
     use super::*;
 
     #[test]
@@ -398,32 +419,32 @@ mod tests {
         }
         for prefix in ["", "/* @[crate::models::Data] */\n\n"] {
             let input = format!("{prefix}#![enable(implicit_some)]\n#![enable(unwrap_newtypes)]\nData(name: \"aoeu\",)");
-            let output = format_ron(&input);
+            let output = formatted(&input);
             assert!(output.contains("#![enable(implicit_some)]"));
             assert!(output.contains("#![enable(unwrap_newtypes)]"));
             assert!(output.contains("    name: \"aoeu\","));
             let data: Data = ron::from_str(&output).unwrap();
             assert_eq!(data.name.as_deref(), Some("aoeu"));
-            assert_eq!(format_ron(&output), output);
+            assert_eq!(formatted(&output), output);
         }
     }
 
     #[test]
     fn comments_in_arrays_keep_no_comma() {
         let input = "[\n    // first\n    (\n        key: \"a\",\n    ),\n    // second\n    (\n        key: \"b\",\n    ),\n]\n";
-        let once = format_ron(input);
+        let once = formatted(input);
 
         assert!(once.contains("// first\n"), "{once}");
         assert!(!once.contains("// first,"), "{once}");
         assert!(once.contains("// second\n"), "{once}");
         // Idempotent: a second pass changes nothing
-        assert_eq!(format_ron(&once), once);
+        assert_eq!(formatted(&once), once);
     }
 
     #[test]
     fn comments_between_fields_are_kept() {
         let input = "(\n    key: \"a\", // trailing\n    // leading\n    params: [],\n)\n";
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
 
         assert!(formatted.contains("// trailing"), "{formatted}");
         assert!(formatted.contains("// leading"), "{formatted}");
@@ -432,7 +453,7 @@ mod tests {
     #[test]
     fn comments_in_maps_are_kept() {
         let input = "{\n    // entry\n    \"a\": 1,\n}\n";
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
 
         assert!(formatted.contains("// entry"), "{formatted}");
         assert!(!formatted.contains("// entry,"), "{formatted}");
@@ -441,14 +462,14 @@ mod tests {
     #[test]
     fn preserves_header_comments_and_invalid_input() {
         let input = "/* header */\n#![enable(implicit_some)]\nData(name: \"x\")";
-        assert!(format_ron(input).starts_with("/* header */"));
-        assert_eq!(format_ron("Data(name:"), "Data(name:");
+        assert!(formatted(input).starts_with("/* header */"));
+        assert_eq!(formatted("Data(name:"), "Data(name:");
     }
 
     #[test]
     fn test_simple_struct() {
         let input = "User(id: 1, name: \"Alice\")";
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
         println!("Formatted:\n{}", formatted);
         assert!(formatted.contains("User("));
         assert!(formatted.contains("    id: 1,"));
@@ -459,7 +480,7 @@ mod tests {
     #[test]
     fn test_empty_parens() {
         let input = "Unit()";
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
         println!("Formatted: '{}'", formatted);
         assert_eq!(formatted, "Unit()");
     }
@@ -467,7 +488,7 @@ mod tests {
     #[test]
     fn test_nested_struct() {
         let input = "Post(author: User(id: 1))";
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
         println!("Formatted:\n{}", formatted);
         assert!(formatted.contains("Post("));
         assert!(formatted.contains("    author: User("));
@@ -479,7 +500,7 @@ mod tests {
     #[test]
     fn test_array() {
         let input = r#"Config(roles: ["admin", "user"])"#;
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
         println!("Formatted:\n{}", formatted);
         assert!(formatted.contains("roles: ["));
         assert!(formatted.contains(r#"        "admin","#));
@@ -490,7 +511,7 @@ mod tests {
     #[test]
     fn test_with_type_annotation() {
         let input = "/* @[crate::User] */\nUser(id: 1)";
-        let formatted = format_ron(input);
+        let formatted = formatted(input);
         println!("Formatted:\n{}", formatted);
         assert!(formatted.contains("/* @[crate::User] */"));
         assert!(formatted.contains("User("));
@@ -499,16 +520,16 @@ mod tests {
 
     #[test]
     fn tuple_elements_go_on_their_own_lines() {
-        let once = format_ron("(1, 2,)");
+        let once = formatted("(1, 2,)");
         let expected = "(
     1,
     2,
 )";
         assert_eq!(once, expected);
         // A trailing comma in the source normalizes to one comma per element
-        assert_eq!(format_ron("(1, 2)"), expected);
+        assert_eq!(formatted("(1, 2)"), expected);
         // Idempotent: a second pass changes nothing
-        assert_eq!(format_ron(&once), once);
+        assert_eq!(formatted(&once), once);
     }
 
     #[test]
@@ -520,7 +541,7 @@ mod tests {
     ),
     3,
 )";
-        assert_eq!(format_ron("((1, 2), 3)"), expected);
+        assert_eq!(formatted("((1, 2), 3)"), expected);
     }
 
     #[test]
@@ -531,20 +552,20 @@ mod tests {
     1,
     2
 )";
-        assert_eq!(format_ron("Pair(1, 2)"), expected);
-        assert_eq!(format_ron("Pair(1, 2,)"), expected);
+        assert_eq!(formatted("Pair(1, 2)"), expected);
+        assert_eq!(formatted("Pair(1, 2,)"), expected);
     }
 
     #[test]
     fn single_value_tuple_struct_stays_inline() {
-        assert_eq!(format_ron("Some(\"value\")"), "Some(\"value\")");
+        assert_eq!(formatted("Some(\"value\")"), "Some(\"value\")");
 
         // The wrapper keeps one line, the wrapped struct still breaks, and its
         // fields are indented relative to the inner level, not to the wrapper
         let expected = "Wrap(Inner(
         a: 1,
     ))";
-        assert_eq!(format_ron("Wrap(Inner(a: 1))"), expected);
+        assert_eq!(formatted("Wrap(Inner(a: 1))"), expected);
     }
 
     #[test]
@@ -553,7 +574,7 @@ mod tests {
         let expected = "Some([
         1,
     ])";
-        assert_eq!(format_ron("Some([1])"), expected);
+        assert_eq!(formatted("Some([1])"), expected);
     }
 
     #[test]
@@ -565,7 +586,7 @@ mod tests {
     /* keep */
     2
 )";
-        assert_eq!(format_ron("Pair(1, /* keep */ 2)"), expected);
+        assert_eq!(formatted("Pair(1, /* keep */ 2)"), expected);
     }
 
     #[test]
@@ -576,7 +597,7 @@ mod tests {
     // note
     2,
 )";
-        assert_eq!(format_ron("(1, // note\n2)"), expected);
+        assert_eq!(formatted("(1, // note\n2)"), expected);
     }
 
     #[test]
@@ -588,14 +609,14 @@ mod tests {
     /* after */
 ]";
         let input = "[\n    // note\n    1,\n    /* after */\n]\n";
-        assert_eq!(format_ron(input), expected);
+        assert_eq!(formatted(input), expected);
     }
 
     #[test]
     fn array_elements_go_on_their_own_lines() {
         let expected = "[\n    1,\n    2,\n]";
-        assert_eq!(format_ron("[1, 2]"), expected);
-        assert_eq!(format_ron("[1, 2,]"), expected);
+        assert_eq!(formatted("[1, 2]"), expected);
+        assert_eq!(formatted("[1, 2,]"), expected);
     }
 
     #[test]
@@ -604,8 +625,8 @@ mod tests {
     "a": 1,
     "b": 2,
 }"#;
-        assert_eq!(format_ron("{\"a\": 1, \"b\": 2}"), expected);
-        assert_eq!(format_ron("{\"a\": 1, \"b\": 2,}"), expected);
+        assert_eq!(formatted("{\"a\": 1, \"b\": 2}"), expected);
+        assert_eq!(formatted("{\"a\": 1, \"b\": 2,}"), expected);
     }
 
     #[test]
@@ -615,15 +636,15 @@ mod tests {
         c: 1,
     ),
 )";
-        assert_eq!(format_ron("A(b: B(c: 1))"), expected);
+        assert_eq!(formatted("A(b: B(c: 1))"), expected);
     }
 
     #[test]
     fn empty_containers_stay_compact() {
-        assert_eq!(format_ron("[]"), "[]");
-        assert_eq!(format_ron("{}"), "{}");
+        assert_eq!(formatted("[]"), "[]");
+        assert_eq!(formatted("{}"), "{}");
         // `()` is the unit value, not an empty container
-        assert_eq!(format_ron("()"), "()");
+        assert_eq!(formatted("()"), "()");
     }
 
     #[test]
@@ -637,15 +658,15 @@ mod tests {
             ("\"text\"", "\"text\""),
             ("Bare", "Bare"),
         ] {
-            assert_eq!(format_ron(input), expected, "input: {input}");
+            assert_eq!(formatted(input), expected, "input: {input}");
         }
     }
 
     #[test]
     fn input_without_a_main_value_is_returned_verbatim() {
-        assert_eq!(format_ron(""), "");
+        assert_eq!(formatted(""), "");
         // Comments alone carry no value to format, so nothing is rewritten
-        assert_eq!(format_ron("// only"), "// only");
-        assert_eq!(format_ron("/* only */"), "/* only */");
+        assert_eq!(formatted("// only"), "// only");
+        assert_eq!(formatted("/* only */"), "/* only */");
     }
 }

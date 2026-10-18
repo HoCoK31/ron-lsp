@@ -1060,8 +1060,9 @@ impl LanguageServer for Backend {
                     }
                 }
 
-                // Format the selected text
-                let formatted = Backend::format_ron(&selected_text);
+                // Format the selected text. Это фрагмент, а не файл: хвостовой
+                // перевод строки не добавляем, иначе вставится лишняя пустая строка.
+                let formatted = Backend::format_ron(&selected_text).trim_end().to_string();
 
                 if formatted != selected_text {
                     return Ok(Some(vec![TextEdit {
@@ -1463,7 +1464,7 @@ mod tests {
     name: "Alice",
     age: 28
 )"#;
-        let formatted = Backend::format_ron(input);
+        let formatted = Backend::format_ron(input).trim_end().to_string();
 
         // Should be able to parse the result
         let parsed = ron::from_str::<ron::Value>(&formatted);
@@ -1493,7 +1494,7 @@ User(
     id: 1,
     name: "Alice"
 )"#;
-        let formatted = Backend::format_ron(input);
+        let formatted = Backend::format_ron(input).trim_end().to_string();
 
         // Should preserve annotation
         assert!(
@@ -1522,7 +1523,7 @@ User(
     name: "Alice",
     roles: ["admin", "user"]
 )"#;
-        let formatted = Backend::format_ron(input);
+        let formatted = Backend::format_ron(input).trim_end().to_string();
 
         // Should be able to parse both
         let original_parsed: ron::Value = ron::from_str(input).expect("Original should parse");
@@ -1559,7 +1560,7 @@ User(
     roles: ["admin", "developer"],
 )"#;
 
-        let formatted = Backend::format_ron(input);
+        let formatted = Backend::format_ron(input).trim_end().to_string();
 
         // Should preserve annotation
         assert!(
@@ -1612,7 +1613,7 @@ Post(
     post_type: Short,
 )"#;
 
-        let formatted = Backend::format_ron(input);
+        let formatted = Backend::format_ron(input).trim_end().to_string();
 
         println!("===== FORMATTED OUTPUT =====");
         println!("{}", formatted);
