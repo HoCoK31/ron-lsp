@@ -879,14 +879,35 @@ async fn validate_field_value_node<'a>(
                 .collect(),
         );
     }
-    if is_std_generic_type(&field_type_normalized) {
+    // `Option<T>`/`Box<T>` around a custom type are transparent - the value itself is
+    // judged below; containers that carry element checks of their own (maps) are not.
+    if is_std_generic_type(&crate::completion::unwrap_wrapper(field_type)) {
         return None;
     }
 
-    // Plain custom type: struct-shaped values are validated here. Enum variants are
-    // left to the RON-value checks, which read the variant from the field's text.
-    let nested_type_info = analyzer.get_type_info(field_type).await?;
-    if matches!(nested_type_info.kind, TypeKind::Enum(_)) || value_node.kind() != "struct" {
+    // Plain custom type - possibly behind `Option<...>` or another wrapper: the value
+    // is judged here when the shape is ours, and the RON-value checks keep the rest.
+    let base_type = crate::completion::unwrap_wrapper(field_type);
+    let nested_type_info = analyzer.get_type_info(&base_type).await?;
+    if let TypeKind::Enum(variants) = &nested_type_info.kind {
+        // A variant with a payload (`FirstParentOf([ ... ])`) is checked node by node;
+        // a bare unit-variant name stays with the RON-value checks.
+        let has_payload = variants.iter().any(|variant| !variant.fields.is_empty());
+        if value_node.kind() == "struct" || has_payload {
+            return Some(
+                Box::pin(check_enum_variant_with_payload(
+                    value_node,
+                    content,
+                    &nested_type_info,
+                    variants,
+                    analyzer,
+                ))
+                .await,
+            );
+        }
+        return None;
+    }
+    if value_node.kind() != "struct" {
         return None;
     }
     let diagnostics = Box::pin(validate_node_with_type_info(
@@ -3010,7 +3031,7 @@ PostReference(Post(
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("unknown variant 'Bogus'")),
+                .any(|d| d.message.to_lowercase().contains("unknown variant 'bogus'")),
             "Bogus is not a valid PostType variant. Got: {:?}",
             diagnostics
         );
