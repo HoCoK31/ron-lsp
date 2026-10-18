@@ -355,6 +355,14 @@ impl LanguageServer for Backend {
             },
         );
 
+        // Модель могла измениться снаружи редактора: к открытию документа
+        // rust-analyzer уже переиндексировал файлы, поэтому скан здесь читает
+        // свежие данные — в отличие от события наблюдателя, которое приходит
+        // раньше готовности анализатора и потому может застать старую модель.
+        if type_annotation.is_some() {
+            self.rust_analyzer.scan_workspace().await;
+        }
+
         // Publish diagnostics
         self.publish_diagnostics(&uri, &content, type_annotation.as_deref())
             .await;
