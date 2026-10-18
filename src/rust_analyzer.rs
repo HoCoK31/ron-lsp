@@ -502,18 +502,6 @@ impl RustAnalyzer {
                     return Some(value.clone());
                 }
             }
-
-            // Тип мог переехать в подмодуль: `content::AbilityDef` находит
-            // `content::types::AbilityDef`, если совпадает последний сегмент пути.
-            let wanted = type_path.rsplit("::").next().unwrap_or(type_path);
-            if !wanted.is_empty() {
-                if let Some((_, value)) = cache
-                    .iter()
-                    .find(|(key, _)| key.rsplit("::").next() == Some(wanted))
-                {
-                    return Some(value.clone());
-                }
-            }
         }
 
         // If not in cache and initial scan hasn't completed, rescan
