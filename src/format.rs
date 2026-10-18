@@ -167,6 +167,15 @@ fn format_struct(
             output.push('\n');
         }
 
+        // An inline payload keeps the indent of the value that carries it: a list
+        // that breaks anyway (`FirstParentOf([A])`) then aligns with its own line,
+        // not one level deeper.
+        let payload_level = if should_inline {
+            indent_level
+        } else {
+            indent_level + 1
+        };
+
         for (i, child) in values.iter().enumerate() {
             if ts_utils::is_trivia(child.kind()) {
                 if !should_inline {
@@ -176,7 +185,7 @@ fn format_struct(
                     child,
                     content,
                     output,
-                    indent_level + 1,
+                    payload_level,
                     indent_str,
                     should_inline,
                 );
@@ -191,7 +200,7 @@ fn format_struct(
                 child,
                 content,
                 output,
-                indent_level + 1,
+                payload_level,
                 indent_str,
                 should_inline,
             );
@@ -560,21 +569,29 @@ mod tests {
     fn single_value_tuple_struct_stays_inline() {
         assert_eq!(formatted("Some(\"value\")"), "Some(\"value\")");
 
-        // The wrapper keeps one line, the wrapped struct still breaks, and its
-        // fields are indented relative to the inner level, not to the wrapper
-        let expected = "Wrap(Inner(
-        a: 1,
-    ))";
+        // The wrapper keeps one line, the wrapped struct still breaks, and its fields
+        // align with the call that carries them, not one level deeper
+        let expected = "Wrap(Inner(\n    a: 1,\n))";
         assert_eq!(formatted("Wrap(Inner(a: 1))"), expected);
     }
 
     #[test]
     fn inline_wrapper_does_not_inline_container_values() {
-        // The inline flag only reaches structs: an array breaks anyway
-        let expected = "Some([
-        1,
-    ])";
+        // The inline flag only reaches structs: an array breaks anyway, and it aligns
+        // with the call that carries it
+        let expected = "Some([\n    1,\n])";
         assert_eq!(formatted("Some([1])"), expected);
+    }
+
+    /// A variant payload is a list: it breaks, but stays aligned with the field that
+    /// carries the call - not one level deeper.
+    #[test]
+    fn variant_payload_aligns_with_its_field() {
+        let expected = "Rule(\n    target: FirstParentOf([\n        Creature,\n    ]),\n)";
+        assert_eq!(
+            formatted("Rule(target: FirstParentOf([Creature]))"),
+            expected
+        );
     }
 
     #[test]
