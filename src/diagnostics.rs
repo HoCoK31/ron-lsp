@@ -703,6 +703,48 @@ fn check_enum_variant_node(
     }
 }
 
+/// A value that has to name an enum variant, with its payload checked as well.
+///
+/// The name is judged first; when the variant takes data, each payload value is
+/// checked against the variant's fields by position, so an unknown kind inside
+/// `FirstParentOf([ ... ])` is reported too, not just the outer name.
+async fn check_enum_variant_with_payload(
+    node: &tree_sitter::Node<'_>,
+    content: &str,
+    enum_info: &TypeInfo,
+    variants: &[EnumVariant],
+    analyzer: &Arc<RustAnalyzer>,
+) -> Vec<Diagnostic> {
+    if let Some(diag) = check_enum_variant_node(node, content, enum_info, variants) {
+        return vec![diag];
+    }
+    let Some(parsed) = crate::ts_utils::extract_enum_variant(node, content) else {
+        return Vec::new();
+    };
+    let Some(variant) = variants.iter().find(|known| known.name == parsed.name) else {
+        return Vec::new();
+    };
+    if variant.fields.is_empty() {
+        return Vec::new();
+    }
+
+    let values = crate::ts_utils::struct_values(node, content);
+    let mut diagnostics = Vec::new();
+    for (value, field) in values.iter().zip(&variant.fields) {
+        if let Some(field_diagnostics) = Box::pin(validate_field_value_node(
+            value,
+            content,
+            &field.type_name,
+            analyzer,
+        ))
+        .await
+        {
+            diagnostics.extend(field_diagnostics);
+        }
+    }
+    diagnostics
+}
+
 /// Validate a single field's value node against its declared Rust type.
 ///
 /// This is the single place that decides how to recurse into generic wrappers
@@ -744,11 +786,16 @@ async fn validate_field_value_node<'a>(
         let mut diagnostics = Vec::new();
         for elem_node in crate::ts_utils::array_value_children(value_node) {
             if let TypeKind::Enum(variants) = &inner_type_info.kind {
-                if let Some(diag) =
-                    check_enum_variant_node(&elem_node, content, &inner_type_info, variants)
-                {
-                    diagnostics.push(diag);
-                }
+                diagnostics.extend(
+                    Box::pin(check_enum_variant_with_payload(
+                        &elem_node,
+                        content,
+                        &inner_type_info,
+                        variants,
+                        analyzer,
+                    ))
+                    .await,
+                );
                 continue;
             }
 
@@ -3809,5 +3856,90 @@ PostReference(Post(
         assert_eq!(portable[0].line, lsp[0].range.start.line);
 
         assert!(validate_ron_syntax_portable("Root(duration: 6)").is_empty());
+    }
+
+    /// A variant payload is checked against the variant's fields: an unknown kind
+    /// inside `FirstParentOf([ ... ])` is reported together with the outer name.
+    #[tokio::test]
+    async fn test_variant_payload_list_validation() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let field = |name: &str, type_name: &str| crate::rust_analyzer::FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let variant = |name: &str, fields: Vec<crate::rust_analyzer::FieldInfo>| EnumVariant {
+            name: name.to_string(),
+            fields,
+            docs: None,
+            line: None,
+            column: None,
+        };
+        analyzer
+            .insert_type_for_test(TypeInfo {
+                name: "Root".to_string(),
+                kind: TypeKind::Struct(vec![field("rules", "Vec<Rule>")]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+        analyzer
+            .insert_type_for_test(TypeInfo {
+                name: "Rule".to_string(),
+                kind: TypeKind::Enum(vec![
+                    variant("FirstParentOf", vec![field("0", "Vec<Kind>")]),
+                    variant("AnyChildOf", vec![]),
+                ]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+        analyzer
+            .insert_type_for_test(TypeInfo {
+                name: "Kind".to_string(),
+                kind: TypeKind::Enum(vec![variant("Creature", vec![]), variant("Item", vec![])]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+
+        let root = analyzer.get_type_info("Root").await.expect("type info");
+        let valid = "Root(\n    rules: [\n        FirstParentOf([Creature, Item]),\n        AnyChildOf,\n    ],\n)";
+        assert!(
+            validate_ron_with_analyzer(valid, &root, analyzer.clone())
+                .await
+                .is_empty(),
+            "a known variant with known kinds stays clean"
+        );
+
+        let bad_kind = valid.replace("Item", "Bogus");
+        let diagnostics = validate_ron_with_analyzer(&bad_kind, &root, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown variant 'Bogus'")),
+            "an unknown kind is reported: {diagnostics:?}"
+        );
+
+        let bad_rule = valid.replace("AnyChildOf", "NopeOf");
+        let diagnostics = validate_ron_with_analyzer(&bad_rule, &root, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown variant 'NopeOf'")),
+            "an unknown rule is reported: {diagnostics:?}"
+        );
     }
 }

@@ -582,6 +582,9 @@ enum Step {
     /// A tuple element: a tuple struct names its fields "0", "1", …, so the
     /// position of the value is the field name.
     Element(usize),
+    /// A value of an enum variant: `FirstParentOf([Filter])` — the identifier names
+    /// the variant and the payload values are its fields, "0", "1", ….
+    Variant { name: String, index: usize },
 }
 
 /// Whether `ancestor` is an ancestor of `node` (or the node itself).
@@ -609,10 +612,9 @@ fn values_in_open_paren<'t>(
     node: &tree_sitter::Node<'t>,
     offset: usize,
 ) -> Option<Vec<tree_sitter::Node<'t>>> {
-    // A struct in parentheses (`( key: …, items: [ … ] )`) is not a tuple.
-    if node.kind() == "struct" {
-        return None;
-    }
+    // A struct in parentheses (`( key: …, items: [ … ] )`) is not a tuple, and a
+    // variant call (`FirstParentOf([ … ])`) is a `struct` node too — the named-field
+    // check below tells them apart, so neither is rejected by the node kind.
 
     let mut open = None;
     let mut closed = false;
@@ -643,6 +645,21 @@ fn values_in_open_paren<'t>(
     }
 
     Some(values)
+}
+
+/// The enum variant a `struct` node stands for: `FirstParentOf([ … ])` begins with
+/// the variant name, while a bare tuple struct `( … )` does not.
+fn variant_name(node: &tree_sitter::Node<'_>, content: &str) -> Option<String> {
+    // Only a `struct` node names a variant: a bare tuple is a `tuple` node.
+    if node.kind() != "struct" {
+        return None;
+    }
+    let first = node.named_child(0)?;
+    if first.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&first, content);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// The path of steps from the file root down to the cursor.
@@ -695,7 +712,11 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
                 .position(|value| node_is_ancestor_or_self(*value, cursor))
                 .or_else(|| values.iter().position(|value| value.start_byte() >= offset))
             {
-                path.push(Step::Element(index));
+                // `FirstParentOf([ … ])` names the enum variant in front of the payload.
+                match variant_name(&node, content) {
+                    Some(name) => path.push(Step::Variant { name, index }),
+                    None => path.push(Step::Element(index)),
+                }
             }
         }
 
@@ -778,6 +799,13 @@ async fn field_type_name(
                 .clone(),
         ),
         Step::Element(index) => Some(base.fields()?.get(*index)?.type_name.clone()),
+        Step::Variant { name, index } => {
+            let TypeKind::Enum(variants) = &base.kind else {
+                return None;
+            };
+            let variant = variants.iter().find(|variant| &variant.name == name)?;
+            Some(variant.fields.get(*index)?.type_name.clone())
+        }
     }
 }
 
@@ -861,6 +889,13 @@ pub(crate) async fn field_at_position(
             .find(|field| &field.name == name)?
             .clone(),
         Step::Element(index) => owner.fields()?.get(*index)?.clone(),
+        Step::Variant { name, index } => {
+            let TypeKind::Enum(variants) = &owner.kind else {
+                return None;
+            };
+            let variant = variants.iter().find(|variant| &variant.name == name)?;
+            variant.fields.get(*index)?.clone()
+        }
     };
 
     Some(FieldAtCursor {
@@ -1181,6 +1216,79 @@ mod tests {
             .expect("completions for the enum");
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["Alpha", "Beta"]);
+    }
+
+    /// A variant payload is a list of values: the cursor inside `Variant([ ... ])` is a
+    /// field of that variant, and the enum variants of its element type are offered.
+    #[tokio::test]
+    async fn variant_payload_offers_its_element_variants() {
+        use crate::rust_analyzer::{EnumVariant, FieldInfo};
+
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let field = |name: &str, type_name: &str| FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let type_of = |name: &str, kind: TypeKind| TypeInfo {
+            name: name.to_string(),
+            kind,
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        let variant = |name: &str, fields: Vec<FieldInfo>| EnumVariant {
+            name: name.to_string(),
+            fields,
+            docs: None,
+            line: None,
+            column: None,
+        };
+        analyzer
+            .insert_type_for_test(type_of(
+                "Root",
+                TypeKind::Struct(vec![field("rules", "Vec<Rule>")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "Rule",
+                TypeKind::Enum(vec![
+                    variant("FirstParentOf", vec![field("0", "Vec<Kind>")]),
+                    variant("AnyChildOf", vec![]),
+                ]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "Kind",
+                TypeKind::Enum(vec![variant("Creature", vec![]), variant("Item", vec![])]),
+            ))
+            .await;
+
+        let content = "Root(\n    rules: [\n        FirstParentOf([\n        ]),\n    ],\n)";
+        let path = path_at_position(content, Position::new(2, 23)).expect("path to the payload");
+        assert_eq!(
+            path,
+            vec![
+                Step::Field("rules".into()),
+                Step::Variant {
+                    name: "FirstParentOf".into(),
+                    index: 0,
+                },
+            ]
+        );
+
+        let items = completions_for_field_path(content, Position::new(2, 23), "Root", analyzer)
+            .await
+            .expect("completions for the payload element");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["Creature", "Item"]);
     }
 
     /// The pair is a tuple struct: the cursor sits inside a tuple value, and the enum
