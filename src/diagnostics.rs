@@ -457,6 +457,17 @@ async fn validate_struct_fields(
                             });
                         }
                         Some(field_info) => {
+                            if present_field_names.contains(&field_name) {
+                                // serde rejects a repeated field at load time: report it here too.
+                                let range =
+                                    ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                                diagnostics.push(Diagnostic {
+                                    range,
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    message: format!("Duplicate field '{}'", field_name),
+                                    ..Default::default()
+                                });
+                            }
                             present_field_names.push(field_name);
 
                             let Some(value_node) = ts_utils::field_value(&field_node) else {
@@ -988,7 +999,16 @@ async fn validate_node_with_type_info<'a>(
                 // Check each field in the RON
                 for field_node in field_nodes {
                     if let Some(field_name) = ts_utils::field_name(&field_node, content) {
-                        present_fields.insert(field_name.to_string());
+                        if !present_fields.insert(field_name.to_string()) {
+                            // serde rejects a repeated field at load time: report it here too.
+                            let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                            diagnostics.push(Diagnostic {
+                                range,
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                message: format!("Duplicate field '{}'", field_name),
+                                ..Default::default()
+                            });
+                        }
 
                         // Check if field exists in type
                         if let Some(field_info) = fields.iter().find(|f| f.name == field_name) {
@@ -3881,6 +3901,40 @@ PostReference(Post(
 
     /// A variant payload is checked against the variant's fields: an unknown kind
     /// inside `FirstParentOf([ ... ])` is reported together with the outer name.
+    /// A repeated field is an error: serde rejects it at load time.
+    #[tokio::test]
+    async fn test_duplicate_field_is_reported() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let put = |name: &str, type_name: &str| crate::rust_analyzer::FieldInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            docs: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+        analyzer
+            .insert_type_for_test(TypeInfo {
+                name: "Root".to_string(),
+                kind: TypeKind::Struct(vec![put("a", "u32"), put("b", "u32")]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+        let root = analyzer.get_type_info("Root").await.expect("type info");
+        let diagnostics =
+            validate_ron_with_analyzer("Root(a: 1, a: 2)", &root, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Duplicate field 'a'")),
+            "{diagnostics:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_variant_payload_list_validation() {
         let analyzer = Arc::new(RustAnalyzer::new());
