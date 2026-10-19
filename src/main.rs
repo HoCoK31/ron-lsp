@@ -1045,11 +1045,15 @@ _field of `{}`_",
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri.to_string();
+        let settings = { self.config.read().await.format.clone() };
+        if !settings.enabled {
+            return Ok(None);
+        }
 
         let documents = self.documents.read().await;
         if let Some(doc) = documents.get(&uri) {
-            // Basic RON formatting: normalize whitespace and indentation
-            let formatted = Backend::format_ron(&doc.content);
+            // Format with the project settings from the `[format]` table of `ron.toml`.
+            let formatted = format::format_ron_with(&doc.content, &settings);
 
             if formatted != doc.content {
                 return Ok(Some(vec![TextEdit {
@@ -1068,6 +1072,10 @@ _field of `{}`_",
     ) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri.to_string();
         let range = params.range;
+        let settings = { self.config.read().await.format.clone() };
+        if !settings.enabled {
+            return Ok(None);
+        }
 
         let documents = self.documents.read().await;
         if let Some(doc) = documents.get(&uri) {
@@ -1109,7 +1117,9 @@ _field of `{}`_",
 
                 // Selected text, not a file: no trailing newline, or an extra empty
                 // line would be inserted.
-                let formatted = Backend::format_ron(&selected_text).trim_end().to_string();
+                let formatted = format::format_ron_with(&selected_text, &settings)
+                    .trim_end()
+                    .to_string();
 
                 if formatted != selected_text {
                     return Ok(Some(vec![TextEdit {
@@ -1254,6 +1264,7 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
 }
 
 impl Backend {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn format_ron(content: &str) -> String {
         format::format_ron(content)
     }
@@ -2121,6 +2132,15 @@ async fn run_check(path: PathBuf) {
 #[cfg(feature = "cli")]
 fn run_format(path: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
+    let settings = std::env::current_dir()
+        .ok()
+        .and_then(|dir| Config::try_load_from_dir(dir).ok().flatten())
+        .map(|config| config.format)
+        .unwrap_or_default();
+    if !settings.enabled {
+        eprintln!("Formatting is disabled in {CONFIG_FILE_NAME} ([format] enabled = false).");
+        return Ok(());
+    }
     let metadata =
         std::fs::metadata(path).with_context(|| format!("Cannot access {}", path.display()))?;
     let files = if metadata.is_file() {
@@ -2141,7 +2161,7 @@ fn run_format(path: &Path) -> anyhow::Result<()> {
     for file in files {
         let content = std::fs::read_to_string(&file)
             .with_context(|| format!("Cannot read {}", file.display()))?;
-        let formatted = format::format_ron(&content);
+        let formatted = format::format_ron_with(&content, &settings);
         if formatted != content {
             std::fs::write(&file, formatted)
                 .with_context(|| format!("Cannot write {}", file.display()))?;
