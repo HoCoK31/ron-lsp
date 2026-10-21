@@ -13,9 +13,36 @@ enum CompletionContext {
     StructType, // Completing struct type name for nested types
 }
 
+/// Field name on the current line when the cursor sits after its colon and no
+/// value has been typed yet.
+///
+/// Tree-sitter cannot represent a field without a value: on `apply_rule:` it
+/// swallows the next field name as the value, so the cursor is no longer inside
+/// a `field` node and completion falls back to field names. The lexical check
+/// keeps the value context tied to the field the user is typing.
+fn empty_field_before_cursor(content: &str, position: Position) -> Option<String> {
+    let line = content.lines().nth(position.line as usize)?;
+    let byte_offset = crate::ts_utils::line_column_to_byte_offset(line, position.character);
+    let prefix = line.get(..byte_offset)?;
+    let trimmed = prefix.trim_start();
+    let (name, rest) = trimmed.split_once(':')?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let name = name.trim_end();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// Determine what we're completing based on cursor position using tree-sitter
 fn get_completion_context(content: &str, position: Position) -> CompletionContext {
     use crate::ts_utils::{self, RonParser};
+
+    if empty_field_before_cursor(content, position).is_some() {
+        return CompletionContext::FieldValue;
+    }
 
     let mut parser = RonParser::new();
     let tree = match parser.parse(content) {
@@ -279,6 +306,9 @@ fn generate_field_completions(
 
 /// Find the field name for the current cursor position using tree-sitter
 fn find_current_field(content: &str, position: Position) -> Option<String> {
+    if let Some(field) = empty_field_before_cursor(content, position) {
+        return Some(field);
+    }
     tree_sitter_parser::get_field_at_position(content, position)
 }
 
@@ -866,6 +896,23 @@ pub(crate) struct FieldAtCursor {
     pub docs: Option<String>,
 }
 
+/// A top-level RON array is described by its element type in `ron.toml`
+/// (`abilities.ron` -> `AbilityDef`), while the tree path starts with `Element(0)`.
+/// Drop those outer element steps: they belong to the file, not to the mapped type.
+fn strip_outer_elements(path: &mut Vec<Step>, top_type: &str) {
+    let top_type = top_type.trim();
+    if top_type.starts_with("Vec<")
+        || top_type.starts_with('[')
+        || top_type.starts_with('(')
+        || top_type.starts_with("&[")
+    {
+        return;
+    }
+    while matches!(path.first(), Some(Step::Element(_))) {
+        path.remove(0);
+    }
+}
+
 /// Finds the field under the cursor through the tree (see [`FieldAtCursor`]).
 pub(crate) async fn field_at_position(
     content: &str,
@@ -873,7 +920,8 @@ pub(crate) async fn field_at_position(
     top_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Option<FieldAtCursor> {
-    let path = path_at_position(content, position)?;
+    let mut path = path_at_position(content, position)?;
+    strip_outer_elements(&mut path, top_type);
     let (last, enclosing) = path.split_last()?;
 
     let mut current = analyzer.get_type_info(top_type).await?;
@@ -932,7 +980,8 @@ pub async fn completions_for_field_path(
         return Some(Vec::new());
     }
 
-    let path = path_at_position(content, position)?;
+    let mut path = path_at_position(content, position)?;
+    strip_outer_elements(&mut path, top_type);
     debug_log(&format!("path: {path:?}"));
     let (last, enclosing) = path.split_last()?;
 
@@ -1493,6 +1542,91 @@ mod tests {
             get_completion_context("", Position::new(0, 0)),
             CompletionContext::FieldName
         );
+    }
+
+    /// A field with an empty value after a nested array keeps the value context.
+    ///
+    /// Tree-sitter parses `apply_rule:` by taking the next field name as its
+    /// value; completion must still resolve the field from the line under the
+    /// cursor, not fall back to the outer struct's field list.
+    #[test]
+    fn empty_field_after_nested_array_is_value_context() {
+        let content = r#"[
+    (
+        key: "ability.sting",
+        damage: [
+            (
+                damage_type_key: "x",
+                delivery: [Melee],
+                formula: "1",
+            ),
+        ],
+        apply_rule:
+        effects: [(key: "effect.poisoned")],
+    ),
+]"#;
+        let position = Position::new(10, 19);
+        assert_eq!(
+            get_completion_context(content, position),
+            CompletionContext::FieldValue
+        );
+        assert_eq!(
+            find_current_field(content, position),
+            Some("apply_rule".to_string())
+        );
+    }
+
+    /// The same empty value is recognized after a simple array field.
+    #[test]
+    fn empty_field_after_simple_array_is_value_context() {
+        let content = r#"[
+    (
+        key: "ability.melee",
+        usable_slots: ["slot.limb.hand"],
+        apply_rule:
+        delivery: [Melee],
+    ),
+]"#;
+        let position = Position::new(4, 19);
+        assert_eq!(
+            get_completion_context(content, position),
+            CompletionContext::FieldValue
+        );
+        assert_eq!(
+            find_current_field(content, position),
+            Some("apply_rule".to_string())
+        );
+    }
+
+    /// The value completion for `apply_rule:` is the enum variants, not fields.
+    #[tokio::test]
+    async fn empty_apply_rule_completion_offers_enum_variants() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "ApplyRule",
+                TypeKind::Enum(vec![variant("AnyChildOf"), variant("FirstParentOf")]),
+            ))
+            .await;
+        let owner = type_of(
+            "Root",
+            TypeKind::Struct(vec![field("apply_rule", "Option<ApplyRule>")]),
+        );
+        analyzer.insert_type_for_test(owner).await;
+        let content = r#"[
+    (
+        damage: [],
+        apply_rule:
+        effects: [(key: "effect.poisoned")],
+    ),
+]"#;
+
+        let position = Position::new(3, 18);
+        let items = completions_for_field_path(content, position, "Root", analyzer)
+            .await
+            .unwrap();
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["AnyChildOf", "FirstParentOf"]);
     }
 
     /// The type name before an opening paren is read from the line under the cursor.
