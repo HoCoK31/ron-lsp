@@ -53,6 +53,9 @@ pub struct FormatSettings {
     pub inline: InlinePolicy,
     /// Override of `inline` for arrays; absent - the shared policy.
     pub array_inline: Option<InlinePolicy>,
+    /// Order named fields as declared in the matching Rust struct or enum
+    /// variant. Unknown types and fields keep their source order.
+    pub sort_fields: bool,
 }
 
 impl Default for FormatSettings {
@@ -67,6 +70,7 @@ impl Default for FormatSettings {
             trailing_comma: true,
             inline: InlinePolicy::Never,
             array_inline: None,
+            sort_fields: false,
         }
     }
 }

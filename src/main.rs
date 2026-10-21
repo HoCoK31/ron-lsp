@@ -4,6 +4,7 @@ mod completion;
 mod config;
 mod diagnostic_reporter;
 mod diagnostics;
+mod field_order;
 mod format;
 mod rust_analyzer;
 mod tree_sitter_parser;
@@ -1050,12 +1051,33 @@ _field of `{}`_",
             return Ok(None);
         }
 
-        let documents = self.documents.read().await;
-        if let Some(doc) = documents.get(&uri) {
-            // Format with the project settings from the `[format]` table of `ron.toml`.
-            let formatted = format::format_ron_with(&doc.content, &settings);
+        let data = {
+            let documents = self.documents.read().await;
+            documents
+                .get(&uri)
+                .map(|doc| (doc.content.clone(), doc.type_annotation.clone()))
+        };
 
-            if formatted != doc.content {
+        if let Some((content, type_annotation)) = data {
+            let orders = if settings.sort_fields {
+                match type_annotation {
+                    Some(type_path) => Some(
+                        field_order::build_field_orders(
+                            &content,
+                            &type_path,
+                            self.rust_analyzer.clone(),
+                        )
+                        .await,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            // Format with the project settings from the `[format]` table of `ron.toml`.
+            let formatted = format::format_ron_with_orders(&content, &settings, orders.as_ref());
+
+            if formatted != content {
                 return Ok(Some(vec![TextEdit {
                     range: Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX)),
                     new_text: formatted,
@@ -1948,7 +1970,7 @@ async fn main() {
 
         match cli.command {
             Some(Commands::Format { path }) => {
-                if let Err(error) = run_format(&path) {
+                if let Err(error) = run_format(&path).await {
                     eprintln!("{error:#}");
                     std::process::exit(1);
                 }
@@ -2130,17 +2152,31 @@ async fn run_check(path: PathBuf) {
 }
 
 #[cfg(feature = "cli")]
-fn run_format(path: &Path) -> anyhow::Result<()> {
+async fn run_format(path: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
-    let settings = std::env::current_dir()
-        .ok()
-        .and_then(|dir| Config::try_load_from_dir(dir).ok().flatten())
-        .map(|config| config.format)
+    let cwd = std::env::current_dir().ok();
+    let config = cwd
+        .as_ref()
+        .and_then(|dir| Config::try_load_from_dir(dir).ok().flatten());
+    let settings = config
+        .as_ref()
+        .map(|config| config.format.clone())
         .unwrap_or_default();
     if !settings.enabled {
         eprintln!("Formatting is disabled in {CONFIG_FILE_NAME} ([format] enabled = false).");
         return Ok(());
     }
+
+    let analyzer = if settings.sort_fields {
+        let analyzer = Arc::new(rust_analyzer::RustAnalyzer::new());
+        if let Some(cwd) = cwd.as_ref() {
+            analyzer.set_workspace_root(cwd).await;
+        }
+        Some(analyzer)
+    } else {
+        None
+    };
+
     let metadata =
         std::fs::metadata(path).with_context(|| format!("Cannot access {}", path.display()))?;
     let files = if metadata.is_file() {
@@ -2161,7 +2197,18 @@ fn run_format(path: &Path) -> anyhow::Result<()> {
     for file in files {
         let content = std::fs::read_to_string(&file)
             .with_context(|| format!("Cannot read {}", file.display()))?;
-        let formatted = format::format_ron_with(&content, &settings);
+        let type_path = config
+            .as_ref()
+            .and_then(|config| config.match_module_path(&file))
+            .cloned();
+        let orders = match (analyzer.as_ref(), type_path) {
+            (Some(analyzer), Some(type_path)) => Some(
+                crate::field_order::build_field_orders(&content, &type_path, analyzer.clone())
+                    .await,
+            ),
+            _ => None,
+        };
+        let formatted = format::format_ron_with_orders(&content, &settings, orders.as_ref());
         if formatted != content {
             std::fs::write(&file, formatted)
                 .with_context(|| format!("Cannot write {}", file.display()))?;

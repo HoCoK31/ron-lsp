@@ -1,8 +1,11 @@
+#![allow(clippy::too_many_arguments)]
+
 /// Tree-sitter based RON formatter
 /// This formatter uses the AST to properly handle formatting
 use crate::{
     annotation_parser,
     config::{FormatSettings, InlinePolicy, LineEnding},
+    field_order::FieldOrders,
     ts_utils::{self, RonParser},
 };
 use tree_sitter::Node;
@@ -15,6 +18,16 @@ pub fn format_ron(content: &str) -> String {
 
 /// Format RON content using tree-sitter AST and the given settings.
 pub fn format_ron_with(content: &str, settings: &FormatSettings) -> String {
+    format_ron_with_orders(content, settings, None)
+}
+
+/// Format RON content and, where the model knows a struct or enum variant,
+/// order its named fields as declared in Rust.
+pub fn format_ron_with_orders(
+    content: &str,
+    settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
+) -> String {
     let indent_str: String = if settings.use_tabs {
         "\t".to_string()
     } else {
@@ -68,6 +81,7 @@ pub fn format_ron_with(content: &str, settings: &FormatSettings) -> String {
             &indent_str,
             false,
             settings,
+            orders,
         );
         result.push_str(&ron_content[main_value.end_byte()..]);
     } else {
@@ -106,6 +120,7 @@ fn format_node(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     let kind = node.kind();
 
@@ -121,7 +136,15 @@ fn format_node(
     // A container may stay on one line: the policy and the width decide.
     if !inline
         && matches!(kind, "struct" | "array" | "map" | "tuple")
-        && try_inline(node, content, output, indent_level, indent_str, settings)
+        && try_inline(
+            node,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            settings,
+            orders,
+        )
     {
         return;
     }
@@ -135,6 +158,7 @@ fn format_node(
             indent_str,
             inline,
             settings,
+            orders,
         ),
         "array" => format_array(
             node,
@@ -144,6 +168,7 @@ fn format_node(
             indent_str,
             inline,
             settings,
+            orders,
         ),
         "map" => format_map(
             node,
@@ -153,6 +178,7 @@ fn format_node(
             indent_str,
             inline,
             settings,
+            orders,
         ),
         "tuple" => format_tuple(
             node,
@@ -162,6 +188,7 @@ fn format_node(
             indent_str,
             inline,
             settings,
+            orders,
         ),
         "field" => format_field(
             node,
@@ -171,6 +198,7 @@ fn format_node(
             indent_str,
             inline,
             settings,
+            orders,
         ),
         "string" | "integer" | "float" | "boolean" | "char" | "identifier" | "unit" => {
             if let Some(text) = ts_utils::node_text(node, content) {
@@ -194,6 +222,7 @@ fn format_struct(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     if let Some(name) = ts_utils::struct_name(node, content) {
         output.push_str(name);
@@ -204,8 +233,10 @@ fn format_struct(
         return;
     }
 
-    let fields = ts_utils::struct_fields(node);
+    let mut fields = ts_utils::struct_fields(node);
     let values = ts_utils::struct_values(node, content);
+    let order = orders.and_then(|orders| orders.get(&node.start_byte()));
+    sort_fields(&mut fields, order.map(Vec::as_slice), content);
 
     if inline {
         output.push('(');
@@ -226,6 +257,7 @@ fn format_struct(
                     indent_str,
                     true,
                     settings,
+                    orders,
                 );
             }
         } else {
@@ -246,6 +278,7 @@ fn format_struct(
                     indent_str,
                     true,
                     settings,
+                    orders,
                 );
             }
         }
@@ -258,41 +291,63 @@ fn format_struct(
     if !fields.is_empty() {
         output.push('\n');
         let children = ts_utils::named_children(node);
-        let last = children
-            .iter()
-            .rposition(|child| !ts_utils::is_trivia(child.kind()));
-        for (index, child) in children.iter().enumerate() {
+        let mut entries: Vec<(Vec<Node>, Node)> = Vec::new();
+        let mut pending = Vec::new();
+        for child in children {
             if ts_utils::is_trivia(child.kind()) {
+                pending.push(child);
+            } else if child.kind() == "field" {
+                entries.push((std::mem::take(&mut pending), child));
+            }
+        }
+        let trailing = pending;
+        sort_entries(&mut entries, order.map(Vec::as_slice), content);
+
+        let last = entries.len().saturating_sub(1);
+        for (index, (leading, field)) in entries.into_iter().enumerate() {
+            for trivia in leading {
                 output.push_str(&indent_str.repeat(indent_level + 1));
                 format_node(
-                    child,
+                    &trivia,
                     content,
                     output,
                     indent_level + 1,
                     indent_str,
                     false,
                     settings,
+                    orders,
                 );
                 output.push('\n');
-                continue;
-            }
-            if child.kind() != "field" {
-                continue;
             }
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_field(
-                child,
+                &field,
                 content,
                 output,
                 indent_level + 1,
                 indent_str,
                 false,
                 settings,
+                orders,
             );
             // A trailing comma is configurable; between fields it is always there.
-            if index != last.unwrap_or(usize::MAX) || settings.trailing_comma {
+            if index != last || settings.trailing_comma {
                 output.push(',');
             }
+            output.push('\n');
+        }
+        for trivia in trailing {
+            output.push_str(&indent_str.repeat(indent_level + 1));
+            format_node(
+                &trivia,
+                content,
+                output,
+                indent_level + 1,
+                indent_str,
+                false,
+                settings,
+                orders,
+            );
             output.push('\n');
         }
         output.push_str(&indent_str.repeat(indent_level));
@@ -324,6 +379,7 @@ fn format_struct(
                 indent_str,
                 single,
                 settings,
+                orders,
             );
             // A tuple-style struct keeps no trailing comma: `Pair(1, 2)`.
             if !trivia && index != last.unwrap_or(usize::MAX) {
@@ -343,6 +399,33 @@ fn format_struct(
     output.push(')');
 }
 
+/// Stable-sort fields by the model order; unknown fields keep their relative
+/// position at the end.
+fn sort_fields(fields: &mut [Node], order: Option<&[String]>, content: &str) {
+    let Some(order) = order else {
+        return;
+    };
+    fields.sort_by_key(|field| field_rank(field, order, content));
+}
+
+/// Stable-sort field entries together with the comments that precede them.
+fn sort_entries(entries: &mut [(Vec<Node>, Node)], order: Option<&[String]>, content: &str) {
+    let Some(order) = order else {
+        return;
+    };
+    entries.sort_by_key(|(_, field)| field_rank(field, order, content));
+}
+
+fn field_rank(field: &Node, order: &[String], content: &str) -> usize {
+    let Some(name) = ts_utils::field_name(field, content) else {
+        return usize::MAX;
+    };
+    order
+        .iter()
+        .position(|candidate| candidate == name)
+        .unwrap_or(usize::MAX)
+}
+
 /// Format a `name: value` field.
 fn format_field(
     node: &Node,
@@ -352,6 +435,7 @@ fn format_field(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     if let Some(name) = ts_utils::field_name(node, content) {
         output.push_str(name);
@@ -366,6 +450,7 @@ fn format_field(
             indent_str,
             inline,
             settings,
+            orders,
         );
     }
 }
@@ -379,6 +464,7 @@ fn format_array(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     if ts_utils::is_empty_structure(node, content) {
         output.push_str("[]");
@@ -406,6 +492,7 @@ fn format_array(
                 indent_str,
                 true,
                 settings,
+                orders,
             );
         }
         output.push(']');
@@ -428,6 +515,7 @@ fn format_array(
                 indent_str,
                 false,
                 settings,
+                orders,
             );
             output.push('\n');
             continue;
@@ -441,6 +529,7 @@ fn format_array(
             indent_str,
             false,
             settings,
+            orders,
         );
         if index != last.unwrap_or(usize::MAX) || settings.trailing_comma {
             output.push(',');
@@ -460,6 +549,7 @@ fn format_map(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     if ts_utils::is_empty_structure(node, content) {
         output.push_str("{}");
@@ -487,6 +577,7 @@ fn format_map(
                 indent_str,
                 true,
                 settings,
+                orders,
             );
         }
         output.push('}');
@@ -509,6 +600,7 @@ fn format_map(
                 indent_str,
                 false,
                 settings,
+                orders,
             );
             output.push('\n');
             continue;
@@ -522,6 +614,7 @@ fn format_map(
             indent_str,
             false,
             settings,
+            orders,
         );
         if index != last.unwrap_or(usize::MAX) || settings.trailing_comma {
             output.push(',');
@@ -541,6 +634,7 @@ fn format_map_entry(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     let children = ts_utils::named_children(entry);
     if children.len() >= 2 {
@@ -552,6 +646,7 @@ fn format_map_entry(
             indent_str,
             inline,
             settings,
+            orders,
         );
         output.push_str(": ");
         format_node(
@@ -562,6 +657,7 @@ fn format_map_entry(
             indent_str,
             inline,
             settings,
+            orders,
         );
     }
 }
@@ -575,6 +671,7 @@ fn format_tuple(
     indent_str: &str,
     inline: bool,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) {
     let elements = ts_utils::named_children(node);
 
@@ -597,6 +694,7 @@ fn format_tuple(
                 indent_str,
                 true,
                 settings,
+                orders,
             );
         }
         output.push(')');
@@ -621,6 +719,7 @@ fn format_tuple(
                 indent_str,
                 false,
                 settings,
+                orders,
             );
             output.push('\n');
             continue;
@@ -634,6 +733,7 @@ fn format_tuple(
             indent_str,
             false,
             settings,
+            orders,
         );
         if index != last.unwrap_or(usize::MAX) || settings.trailing_comma {
             output.push(',');
@@ -673,6 +773,7 @@ fn try_inline(
     indent_level: usize,
     indent_str: &str,
     settings: &FormatSettings,
+    orders: Option<&FieldOrders>,
 ) -> bool {
     let policy = match node.kind() {
         "array" => settings.array_inline.unwrap_or(settings.inline),
@@ -698,6 +799,7 @@ fn try_inline(
         indent_str,
         true,
         settings,
+        orders,
     );
     if candidate.contains('\n') {
         return false;

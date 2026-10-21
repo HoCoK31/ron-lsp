@@ -43,6 +43,8 @@ ron-lsp format
 
 Same deal with the optional path. (e.g. `ron-lsp format crates/sub-crate` - it'll format all `.ron` files from that point.) No annotations needed, and it'll keep things like `#![enable(implicit_some)]`.
 
+If a file has a type annotation or a `ron.toml` mapping, `[format] sort_fields = true` orders named struct fields and enum-variant payload fields as declared in the Rust model. Unknown types and fields keep their source order; trailing comments stay with the field they precede.
+
 ## Usage
 
 ### Type Annotation Format
@@ -61,6 +63,7 @@ User(
 ```
 
 The LSP will:
+
 1. Parse the `@[crate::models::User]` annotation
 2. Find the `User` struct in your Rust project
 3. Extract field names, types, and documentation
@@ -73,6 +76,7 @@ If you have a custom `Deserialize` impl (or use `#[serde(transparent)]`, `from`,
 ### Example
 
 **src/models/user.rs:**
+
 ```rust
 pub struct User {
     pub id: u32,
@@ -84,6 +88,7 @@ pub struct User {
 ```
 
 **data/users.ron:**
+
 ```ron
 /* @[crate::models::User] */
 
@@ -156,7 +161,6 @@ type = "crate::models::User"
 1. Type annotation in RON file
 2. Type declaration in ron.toml, declarations are tested in the order of the file
 
-
 ## Editor Integration
 
 Expand a section below for editor-specific instructions.
@@ -186,10 +190,10 @@ Then, either ensure 'ron-lsp' is in your PATH or update `.vscode/settings.json`:
   "ronLsp.serverPath": "/path/to/ron-lsp"
 }
 ```
+
 </details>
 
 [![Visual Studio Marketplace Badge](https://img.shields.io/badge/Visual%20Studio%20Marketplace-0.1.0-blue.svg)](https://marketplace.visualstudio.com/items?itemName=JasonMcGhee.ron-lsp)
-
 
 <details>
 <summary><h3>JetBrains</h3></summary>
@@ -217,7 +221,6 @@ Then, either ensure 'ron-lsp' is in your PATH or update "Server path" in `Settin
 </details>
 
 [![JetBrains Plugin Version](https://img.shields.io/jetbrains/plugin/v/28862-ron-lsp)](https://plugins.jetbrains.com/plugin/28862-ron-lsp)
-
 
 <details>
 <summary><h3>Neovim</h3></summary>
