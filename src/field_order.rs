@@ -12,8 +12,14 @@ use crate::{
 use std::{collections::HashMap, sync::Arc};
 use tree_sitter::Node;
 
-/// Field names by struct-node start byte.
-pub type FieldOrders = HashMap<usize, Vec<String>>;
+/// Ordering information keyed by tree-sitter node start byte.
+#[derive(Debug, Default)]
+pub struct FieldOrders {
+    /// Named fields of a struct node or an enum struct variant.
+    pub fields: HashMap<usize, Vec<String>>,
+    /// Unit variants of an array node whose elements are enum values.
+    pub variants: HashMap<usize, Vec<String>>,
+}
 
 /// Build field orders for the values in `content` whose root type is
 /// `root_type`.
@@ -26,7 +32,7 @@ pub async fn build_field_orders(
     root_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> FieldOrders {
-    let mut orders = FieldOrders::new();
+    let mut orders = FieldOrders::default();
     // The formatter strips the type annotation before parsing, so the tree
     // offsets used here must be relative to the same RON text.
     let ron_content = if content.trim_start().starts_with("/*")
@@ -79,6 +85,20 @@ pub async fn build_field_orders(
         // Arrays carry `Vec<T>` in the model; each element is a `T`.
         if node.kind() == "array" {
             if let Some(inner) = vector_inner(&type_name) {
+                // A `Vec<Enum>` is a list of unit variants: sort it by the
+                // enum declaration order, while an array of structs keeps its
+                // element order and only has its nested fields sorted.
+                if let Some(info) = analyzer.get_type_info(&unwrap_wrappers(&inner)).await {
+                    if let TypeKind::Enum(variants) = &info.kind {
+                        orders.variants.insert(
+                            node.start_byte(),
+                            variants
+                                .iter()
+                                .map(|variant| variant.name.clone())
+                                .collect(),
+                        );
+                    }
+                }
                 for element in ts_utils::array_value_children(&node) {
                     work.push((element, inner.clone()));
                 }
@@ -101,7 +121,7 @@ pub async fn build_field_orders(
                 .map(|field| field.name.clone())
                 .collect();
             if !names.is_empty() {
-                orders.insert(node.start_byte(), names);
+                orders.fields.insert(node.start_byte(), names);
             }
 
             for field in ts_utils::struct_fields(&node) {
@@ -250,6 +270,7 @@ mod tests {
                     field("b", "i32"),
                     field("nested", "Variant"),
                     field("list", "Vec<Variant>"),
+                    field("targets", "Vec<TargetKind>"),
                 ]),
             ))
             .await;
@@ -265,6 +286,34 @@ mod tests {
                 }]),
             ))
             .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "TargetKind",
+                TypeKind::Enum(vec![
+                    EnumVariant {
+                        name: "enemy".into(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                    EnumVariant {
+                        name: "ally".into(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                    EnumVariant {
+                        name: "neutral".into(),
+                        fields: vec![],
+                        docs: None,
+                        line: None,
+                        column: None,
+                    },
+                ]),
+            ))
+            .await;
 
         let content = r#"/* @[crate::Root] */
 (
@@ -275,6 +324,7 @@ mod tests {
         a: 4,
     ),
     list: [Variant(z: 5, a: 6)],
+    targets: [neutral, enemy],
     // a is first in the model
     a: 1,
 )"#;
@@ -296,6 +346,14 @@ mod tests {
         assert!(
             formatted.contains("nested: Variant(\n        a: 4,\n        z: 3,"),
             "variant payload follows the model: {formatted}"
+        );
+        assert!(
+            formatted.contains(
+                "targets: [
+        enemy,
+        neutral,"
+            ),
+            "enum lists follow the model: {formatted}"
         );
         assert!(
             formatted.contains("list: [\n        Variant(\n            a: 6,\n            z: 5,"),

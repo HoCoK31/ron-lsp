@@ -235,7 +235,7 @@ fn format_struct(
 
     let mut fields = ts_utils::struct_fields(node);
     let values = ts_utils::struct_values(node, content);
-    let order = orders.and_then(|orders| orders.get(&node.start_byte()));
+    let order = orders.and_then(|orders| orders.fields.get(&node.start_byte()));
     sort_fields(&mut fields, order.map(Vec::as_slice), content);
 
     if inline {
@@ -426,6 +426,37 @@ fn field_rank(field: &Node, order: &[String], content: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Sort unit enum values by declaration order; payload variants and unknown
+/// values stay at the end in source order.
+fn sort_enum_values(values: &mut [&Node], order: Option<&[String]>, content: &str) {
+    let Some(order) = order else {
+        return;
+    };
+    values.sort_by_key(|value| enum_rank(value, order, content));
+}
+
+fn sort_enum_entries(entries: &mut [(Vec<Node>, Node)], order: Option<&[String]>, content: &str) {
+    let Some(order) = order else {
+        return;
+    };
+    entries.sort_by_key(|(_, value)| enum_rank(value, order, content));
+}
+
+fn enum_rank(value: &Node, order: &[String], content: &str) -> usize {
+    let name = if value.kind() == "identifier" || value.kind() == "unit" {
+        ts_utils::node_text(value, content)
+    } else {
+        ts_utils::struct_name(value, content)
+    };
+    let Some(name) = name else {
+        return usize::MAX;
+    };
+    order
+        .iter()
+        .position(|candidate| candidate == name)
+        .unwrap_or(usize::MAX)
+}
+
 /// Format a `name: value` field.
 fn format_field(
     node: &Node,
@@ -472,14 +503,17 @@ fn format_array(
     }
 
     let elements = ts_utils::named_children(node);
+    let variant_order = orders.and_then(|orders| orders.variants.get(&node.start_byte()));
 
     if inline {
         output.push('[');
-        let mut first = true;
-        for element in elements
+        let mut values: Vec<&Node> = elements
             .iter()
             .filter(|element| !ts_utils::is_trivia(element.kind()))
-        {
+            .collect();
+        sort_enum_values(&mut values, variant_order.map(Vec::as_slice), content);
+        let mut first = true;
+        for element in values {
             if !first {
                 output.push_str(", ");
             }
@@ -499,16 +533,26 @@ fn format_array(
         return;
     }
 
-    let last = elements
-        .iter()
-        .rposition(|element| !ts_utils::is_trivia(element.kind()));
+    let mut entries: Vec<(Vec<Node>, Node)> = Vec::new();
+    let mut pending = Vec::new();
+    for element in elements {
+        if ts_utils::is_trivia(element.kind()) {
+            pending.push(element);
+        } else {
+            entries.push((std::mem::take(&mut pending), element));
+        }
+    }
+    let trailing = pending;
+    sort_enum_entries(&mut entries, variant_order.map(Vec::as_slice), content);
+
+    let last = entries.len().saturating_sub(1);
     output.push('[');
     output.push('\n');
-    for (index, element) in elements.iter().enumerate() {
-        if ts_utils::is_trivia(element.kind()) {
+    for (index, (leading, element)) in entries.into_iter().enumerate() {
+        for trivia in leading {
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_node(
-                element,
+                &trivia,
                 content,
                 output,
                 indent_level + 1,
@@ -518,11 +562,10 @@ fn format_array(
                 orders,
             );
             output.push('\n');
-            continue;
         }
         output.push_str(&indent_str.repeat(indent_level + 1));
         format_node(
-            element,
+            &element,
             content,
             output,
             indent_level + 1,
@@ -531,9 +574,23 @@ fn format_array(
             settings,
             orders,
         );
-        if index != last.unwrap_or(usize::MAX) || settings.trailing_comma {
+        if index != last || settings.trailing_comma {
             output.push(',');
         }
+        output.push('\n');
+    }
+    for trivia in trailing {
+        output.push_str(&indent_str.repeat(indent_level + 1));
+        format_node(
+            &trivia,
+            content,
+            output,
+            indent_level + 1,
+            indent_str,
+            false,
+            settings,
+            orders,
+        );
         output.push('\n');
     }
     output.push_str(&indent_str.repeat(indent_level));
