@@ -9,7 +9,10 @@ use crate::{
     rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind},
     ts_utils::{self, RonParser},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tree_sitter::Node;
 
 /// Ordering information keyed by tree-sitter node start byte.
@@ -19,6 +22,8 @@ pub struct FieldOrders {
     pub fields: HashMap<usize, Vec<String>>,
     /// Unit variants of an array node whose elements are enum values.
     pub variants: HashMap<usize, Vec<String>>,
+    /// String arrays whose values are a set-like list of keys/names.
+    pub strings: HashSet<usize>,
 }
 
 /// Build field orders for the values in `content` whose root type is
@@ -88,7 +93,9 @@ pub async fn build_field_orders(
                 // A `Vec<Enum>` is a list of unit variants: sort it by the
                 // enum declaration order, while an array of structs keeps its
                 // element order and only has its nested fields sorted.
-                if let Some(info) = analyzer.get_type_info(&unwrap_wrappers(&inner)).await {
+                if is_string_type(&inner) {
+                    orders.strings.insert(node.start_byte());
+                } else if let Some(info) = analyzer.get_type_info(&unwrap_wrappers(&inner)).await {
                     if let TypeKind::Enum(variants) = &info.kind {
                         orders.variants.insert(
                             node.start_byte(),
@@ -208,6 +215,13 @@ fn unwrap_wrappers(type_name: &str) -> String {
     }
 }
 
+fn is_string_type(type_name: &str) -> bool {
+    let compact = type_name.replace(' ', "");
+    let compact = compact.trim_start_matches('&');
+    matches!(compact, "str" | "String" | "&str")
+        || compact.starts_with("Cow<") && compact.ends_with("str>")
+}
+
 fn is_positional(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit())
 }
@@ -271,6 +285,7 @@ mod tests {
                     field("nested", "Variant"),
                     field("list", "Vec<Variant>"),
                     field("targets", "Vec<TargetKind>"),
+                    field("names", "Vec<String>"),
                 ]),
             ))
             .await;
@@ -325,15 +340,17 @@ mod tests {
     ),
     list: [Variant(z: 5, a: 6)],
     targets: [neutral, enemy],
+    names: ["zeta", "alpha"],
     // a is first in the model
     a: 1,
 )"#;
         let orders = build_field_orders(content, "Root", analyzer).await;
-        let formatted = crate::format::format_ron_with_orders(
-            content,
-            &crate::config::FormatSettings::default(),
-            Some(&orders),
-        );
+        let settings = crate::config::FormatSettings {
+            sort_fields: true,
+            sort_strings: true,
+            ..Default::default()
+        };
+        let formatted = crate::format::format_ron_with_orders(content, &settings, Some(&orders));
 
         assert!(
             formatted.contains("// a is first in the model\n    a: 1,\n    // b comes from the model after a\n    b: 2,"),

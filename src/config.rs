@@ -56,6 +56,9 @@ pub struct FormatSettings {
     /// Order named fields as declared in the matching Rust struct or enum
     /// variant. Unknown types and fields keep their source order.
     pub sort_fields: bool,
+    /// Sort string arrays alphabetically when the model declares them as
+    /// `Vec<String>` (keys, names and other set-like lists).
+    pub sort_strings: bool,
 }
 
 impl Default for FormatSettings {
@@ -71,6 +74,7 @@ impl Default for FormatSettings {
             inline: InlinePolicy::Never,
             array_inline: None,
             sort_fields: false,
+            sort_strings: false,
         }
     }
 }

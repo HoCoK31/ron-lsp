@@ -457,6 +457,25 @@ fn enum_rank(value: &Node, order: &[String], content: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+fn sort_string_values(values: &mut [&Node], content: &str) {
+    values.sort_by_key(|value| string_rank(value, content));
+}
+
+fn sort_string_entries(entries: &mut [(Vec<Node>, Node)], content: &str) {
+    entries.sort_by_key(|(_, value)| string_rank(value, content));
+}
+
+fn string_rank(value: &Node, content: &str) -> String {
+    let text = ts_utils::node_text(value, content)
+        .unwrap_or_default()
+        .trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(text);
+    text.to_lowercase()
+}
+
 /// Format a `name: value` field.
 fn format_field(
     node: &Node,
@@ -503,7 +522,13 @@ fn format_array(
     }
 
     let elements = ts_utils::named_children(node);
-    let variant_order = orders.and_then(|orders| orders.variants.get(&node.start_byte()));
+    let variant_order = if settings.sort_fields {
+        orders.and_then(|orders| orders.variants.get(&node.start_byte()))
+    } else {
+        None
+    };
+    let string_order = settings.sort_strings
+        && orders.is_some_and(|orders| orders.strings.contains(&node.start_byte()));
 
     if inline {
         output.push('[');
@@ -511,7 +536,11 @@ fn format_array(
             .iter()
             .filter(|element| !ts_utils::is_trivia(element.kind()))
             .collect();
-        sort_enum_values(&mut values, variant_order.map(Vec::as_slice), content);
+        if string_order {
+            sort_string_values(&mut values, content);
+        } else {
+            sort_enum_values(&mut values, variant_order.map(Vec::as_slice), content);
+        }
         let mut first = true;
         for element in values {
             if !first {
@@ -544,6 +573,9 @@ fn format_array(
     }
     let trailing = pending;
     sort_enum_entries(&mut entries, variant_order.map(Vec::as_slice), content);
+    if string_order {
+        sort_string_entries(&mut entries, content);
+    }
 
     let last = entries.len().saturating_sub(1);
     output.push('[');

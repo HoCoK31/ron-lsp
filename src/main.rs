@@ -1059,7 +1059,7 @@ _field of `{}`_",
         };
 
         if let Some((content, type_annotation)) = data {
-            let orders = if settings.sort_fields {
+            let orders = if settings.sort_fields || settings.sort_strings {
                 match type_annotation {
                     Some(type_path) => Some(
                         field_order::build_field_orders(
@@ -2167,7 +2167,7 @@ async fn run_format(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let analyzer = if settings.sort_fields {
+    let analyzer = if settings.sort_fields || settings.sort_strings {
         let analyzer = Arc::new(rust_analyzer::RustAnalyzer::new());
         if let Some(cwd) = cwd.as_ref() {
             analyzer.set_workspace_root(cwd).await;

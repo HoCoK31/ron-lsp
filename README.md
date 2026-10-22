@@ -43,7 +43,7 @@ ron-lsp format
 
 Same deal with the optional path. (e.g. `ron-lsp format crates/sub-crate` - it'll format all `.ron` files from that point.) No annotations needed, and it'll keep things like `#![enable(implicit_some)]`.
 
-If a file has a type annotation or a `ron.toml` mapping, `[format] sort_fields = true` orders named struct fields and enum-variant payload fields as declared in the Rust model. Unknown types and fields keep their source order; trailing comments stay with the field they precede.
+If a file has a type annotation or a `ron.toml` mapping, `[format] sort_fields = true` orders named struct fields and enum-variant payload fields as declared in the Rust model. `[format] sort_strings = true` additionally sorts `Vec<String>` arrays alphabetically (keys and names). Unknown types and fields keep their source order; trailing comments stay with the field they precede.
 
 ## Usage
 
