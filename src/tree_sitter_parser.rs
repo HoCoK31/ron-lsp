@@ -320,15 +320,6 @@ fn collect_fields_in_node(
                 });
             }
         }
-
-        // Recurse for nested structures
-        collect_fields_in_node(
-            &child,
-            content,
-            variant_name,
-            containing_field_name,
-            locations,
-        );
     }
 }
 
@@ -562,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_all_variant_field_locations_repeats_nested_fields() {
+    fn test_find_all_variant_field_locations_keeps_nested_variants_out_of_the_parent() {
         let content = r#"RootItem(
     kind: Detailed(
         inner: Nested(
@@ -584,12 +575,12 @@ mod tests {
             })
             .collect();
 
-        // Fields of a nested struct belong to the enclosing variant too.
+        // A nested struct is validated against its own type, not as a field of
+        // the enclosing variant.
         assert_eq!(
             summary,
             vec![
                 ("Detailed", "kind", Some("inner"), 2),
-                ("Detailed", "kind", Some("depth"), 3),
                 ("Nested", "inner", Some("depth"), 3),
             ]
         );
