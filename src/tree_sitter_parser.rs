@@ -356,6 +356,38 @@ pub fn extract_fields_from_ron(content: &str) -> Vec<String> {
     fields.into_iter().collect()
 }
 
+/// Direct field names of the struct whose payload contains the cursor.
+///
+/// Completion must not treat fields of another struct or of a different enum
+/// variant as already used: `Ball(range: …, speed: …)` is checked on its own
+/// payload, not against the fields of the file root. Arrays and tuples are not
+/// structs and produce no names.
+pub fn extract_fields_at_position(content: &str, position: Position) -> Vec<String> {
+    let mut parser = RonParser::new();
+    let Some(tree) = parser.parse(content) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let byte_offset = position_to_byte_offset(content, position);
+    let Some(mut current) = root.descendant_for_byte_range(byte_offset, byte_offset) else {
+        return Vec::new();
+    };
+
+    while current.kind() != "struct" {
+        if matches!(current.kind(), "array" | "map" | "tuple") {
+            return Vec::new();
+        }
+        let Some(parent) = current.parent() else {
+            return Vec::new();
+        };
+        current = parent;
+    }
+
+    let mut fields = std::collections::HashSet::new();
+    collect_direct_field_names(&current, content, &mut fields);
+    fields.into_iter().collect()
+}
+
 /// Collect only direct child field names from a struct node (not recursively)
 fn collect_direct_field_names(
     node: &Node,

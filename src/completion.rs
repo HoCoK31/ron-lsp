@@ -36,9 +36,61 @@ fn empty_field_before_cursor(content: &str, position: Position) -> Option<String
     Some(name.to_string())
 }
 
+/// Whether the cursor sits where a named field may start: after a comma or an
+/// opening paren of a struct, with only whitespace between it and the cursor.
+///
+/// The tree cannot express a field without a name: a trailing comma makes the
+/// previous field (`falloff: "0.5",`) the node under the cursor, and a path built
+/// from that node would point at the previous field's value. Named structs are
+/// told apart from arrays, maps and tuples by the nearest enclosing container.
+pub(crate) fn is_field_name_position(content: &str, position: Position) -> bool {
+    use crate::ts_utils::{self, RonParser};
+
+    if cursor_inside_string(content, position) {
+        return false;
+    }
+
+    let before = content
+        .get(..ts_utils::position_to_byte_offset(content, position))
+        .unwrap_or_default()
+        .trim_end();
+    if !before.ends_with(',') && !before.ends_with('(') {
+        return false;
+    }
+
+    let mut parser = RonParser::new();
+    let Some(tree) = parser.parse(content) else {
+        return false;
+    };
+    let Some(node) = ts_utils::node_at_position(&tree, content, position) else {
+        return false;
+    };
+
+    // The nearest value container decides: an array or a tuple has no named
+    // fields even when it lives inside a struct field.
+    let mut current = Some(node);
+    while let Some(node) = current {
+        match node.kind() {
+            "array" | "map" | "tuple" => return false,
+            "struct" => {
+                let mut cursor = node.walk();
+                return node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "field");
+            }
+            _ => current = node.parent(),
+        }
+    }
+    false
+}
+
 /// Determine what we're completing based on cursor position using tree-sitter
 fn get_completion_context(content: &str, position: Position) -> CompletionContext {
     use crate::ts_utils::{self, RonParser};
+
+    if is_field_name_position(content, position) {
+        return CompletionContext::FieldName;
+    }
 
     if empty_field_before_cursor(content, position).is_some() {
         return CompletionContext::FieldValue;
@@ -181,8 +233,8 @@ fn generate_field_completions(
 ) -> Vec<CompletionItem> {
     match &type_info.kind {
         TypeKind::Struct(fields) => {
-            // Get fields already used in the RON file
-            let used_fields = tree_sitter_parser::extract_fields_from_ron(content);
+            // Get fields already used in this struct payload
+            let used_fields = tree_sitter_parser::extract_fields_at_position(content, position);
 
             // Generate completions for unused fields
             fields
@@ -222,7 +274,8 @@ fn generate_field_completions(
             {
                 if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
                     // Complete the variant's fields
-                    let used_fields = tree_sitter_parser::extract_fields_from_ron(content);
+                    let used_fields =
+                        tree_sitter_parser::extract_fields_at_position(content, position);
                     return variant
                         .fields
                         .iter()
@@ -974,6 +1027,11 @@ pub async fn completions_for_field_path(
     top_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Option<Vec<CompletionItem>> {
+    // At a field-name position the path still names the previous field; its value
+    // type would answer the wrong question, so field-name completion takes over.
+    if is_field_name_position(content, position) {
+        return None;
+    }
     // There is nothing to suggest inside a string: an unclosed quote swallows the rest
     // of the file, and any list would be made up.
     if cursor_inside_string(content, position) {
@@ -1510,6 +1568,42 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["key"]);
         assert_eq!(items[0].insert_text.as_deref(), Some("key: "));
+    }
+
+    /// A trailing comma in a struct variant payload is a field-name position, not
+    /// the value of the field before it: only the missing Ball field is offered.
+    #[test]
+    fn variant_payload_after_comma_completes_missing_fields() {
+        let shape = type_of(
+            "Shape",
+            TypeKind::Enum(vec![EnumVariant {
+                name: "Ball".to_string(),
+                fields: vec![
+                    field("range", "String"),
+                    field("speed", "String"),
+                    field("radius", "String"),
+                    field("blast_speed", "String"),
+                    field("falloff", "String"),
+                ],
+                docs: None,
+                line: None,
+                column: None,
+            }]),
+        );
+        let content = "Root(
+    shape: Ball(range: \"14\", speed: \"12\", radius: \"2\", falloff: \"0.5\", ),
+)";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, (line.find(", )").unwrap() + 1) as u32);
+
+        assert_eq!(
+            get_completion_context(content, position),
+            CompletionContext::FieldName
+        );
+        let items = generate_field_completions(content, position, &shape);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["blast_speed"]);
+        assert_eq!(items[0].insert_text.as_deref(), Some("blast_speed: "));
     }
 
     /// The cursor context: a type in the value position, a value, or a field name.

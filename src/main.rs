@@ -1337,8 +1337,18 @@ impl Backend {
         // Start with the top-level type
         let mut current_type_info = self.rust_analyzer.get_type_info(top_level_type_path).await;
 
-        // Navigate through the nested contexts (skip first since it's the top-level type we already have)
-        for context in contexts.iter().skip(1) {
+        // The outermost context is the top-level type only when the document
+        // spells its name (`AbilityDef(...)`); a bare tuple item `( ... )` has no
+        // name, so the first context is already a nested variant (`Ball`).
+        let first_is_top = contexts.first().is_some_and(|context| {
+            top_level_type_path
+                .rsplit("::")
+                .next()
+                .is_some_and(|name| name == context.type_name)
+        });
+
+        // Navigate through the nested contexts.
+        for context in contexts.iter().skip(usize::from(first_is_top)) {
             // Clone the current type info to avoid borrow checker issues
             let info = match current_type_info {
                 Some(ref info) => info.clone(),
