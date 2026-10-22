@@ -356,12 +356,13 @@ pub fn extract_fields_from_ron(content: &str) -> Vec<String> {
     fields.into_iter().collect()
 }
 
-/// Direct field names of the struct whose payload contains the cursor.
+/// Direct field names of the record whose payload contains the cursor.
 ///
 /// Completion must not treat fields of another struct or of a different enum
 /// variant as already used: `Ball(range: …, speed: …)` is checked on its own
-/// payload, not against the fields of the file root. Arrays and tuples are not
-/// structs and produce no names.
+/// payload, not against the fields of the file root. A tuple is a record too
+/// when it spells names (`projectile: (key: …)`); arrays, maps and positional
+/// tuples produce no names.
 pub fn extract_fields_at_position(content: &str, position: Position) -> Vec<String> {
     let mut parser = RonParser::new();
     let Some(tree) = parser.parse(content) else {
@@ -373,8 +374,8 @@ pub fn extract_fields_at_position(content: &str, position: Position) -> Vec<Stri
         return Vec::new();
     };
 
-    while current.kind() != "struct" {
-        if matches!(current.kind(), "array" | "map" | "tuple") {
+    while current.kind() != "struct" && current.kind() != "tuple" {
+        if matches!(current.kind(), "array" | "map") {
             return Vec::new();
         }
         let Some(parent) = current.parent() else {

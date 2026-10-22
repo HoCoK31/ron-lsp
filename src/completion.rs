@@ -66,17 +66,80 @@ pub(crate) fn is_field_name_position(content: &str, position: Position) -> bool 
         return false;
     };
 
-    // The nearest value container decides: an array or a tuple has no named
-    // fields even when it lives inside a struct field.
+    // The nearest value container decides: an array has no named fields; a bare
+    // record is recognized by its field names (`projectile: (key: …)`), otherwise
+    // it is positional and has nothing to offer.
     let mut current = Some(node);
     while let Some(node) = current {
         match node.kind() {
-            "array" | "map" | "tuple" => return false,
+            "array" | "map" => return false,
+            "tuple" => {
+                let mut cursor = node.walk();
+                return node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "field");
+            }
             "struct" => {
                 let mut cursor = node.walk();
                 return node
                     .children(&mut cursor)
                     .any(|child| child.kind() == "field");
+            }
+            _ => current = node.parent(),
+        }
+    }
+    false
+}
+
+/// Whether the cursor is in an anonymous record that is a field value
+/// (`projectile: (key: …, |)`), rather than in a top-level record or a named
+/// struct variant (`Ball(…)`).
+///
+/// Such a record has no type name of its own; its owner is the type of the
+/// enclosing field, so completion must use the field's type instead of walking
+/// up to the document type.
+pub(crate) fn anonymous_record_field_value(content: &str, position: Position) -> bool {
+    use crate::ts_utils::{self, RonParser};
+
+    let mut parser = RonParser::new();
+    let Some(tree) = parser.parse(content) else {
+        return false;
+    };
+    let Some(node) = ts_utils::node_at_position(&tree, content, position) else {
+        return false;
+    };
+
+    let mut current = Some(node);
+    while let Some(node) = current {
+        match node.kind() {
+            "array" | "map" => return false,
+            "tuple" => {
+                let mut cursor = node.walk();
+                if !node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "field")
+                {
+                    return false;
+                }
+                return node.parent().is_some_and(|parent| parent.kind() == "field");
+            }
+            "struct" => {
+                let mut cursor = node.walk();
+                if !node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "field")
+                {
+                    return false;
+                }
+                // A named struct (`Ball(…)`) is an enum variant, not a bare
+                // record: its first child is the identifier.
+                let named = node
+                    .named_child(0)
+                    .is_some_and(|child| child.kind() == "identifier");
+                if named {
+                    return false;
+                }
+                return node.parent().is_some_and(|parent| parent.kind() == "field");
             }
             _ => current = node.parent(),
         }
@@ -1582,6 +1645,42 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["key"]);
         assert_eq!(items[0].insert_text.as_deref(), Some("key: "));
+    }
+
+    /// An anonymous record (`projectile: (key: …)`) is a field-name context too:
+    /// only the missing ProjectileSpec field is offered, not the outer AbilityDef
+    /// fields.
+    #[test]
+    fn tuple_record_after_comma_completes_missing_fields() {
+        let spec = type_of(
+            "ProjectileSpec",
+            TypeKind::Struct(vec![field("key", "String"), field("consumable", "bool")]),
+        );
+        let content = "AbilityDef(
+    projectile: (key: \"item.arrow\", ),
+)";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(1, (line.find(", )").unwrap() + 1) as u32);
+
+        assert!(is_field_name_position(content, position));
+        assert!(anonymous_record_field_value(content, position));
+        assert_eq!(
+            get_completion_context(content, position),
+            CompletionContext::FieldName
+        );
+        let items = generate_field_completions(content, position, &spec);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["consumable"]);
+        assert_eq!(items[0].insert_text.as_deref(), Some("consumable: "));
+
+        // Both fields are present: the record owns the answer, so it is empty
+        // rather than the outer AbilityDef field list.
+        let all = "AbilityDef(
+    projectile: (key: \"item.arrow\", consumable: true, ),
+)";
+        let all_line = all.lines().nth(1).unwrap();
+        let all_position = Position::new(1, (all_line.find(", )").unwrap() + 1) as u32);
+        assert!(generate_field_completions(all, all_position, &spec).is_empty());
     }
 
     /// A trailing comma in a struct variant payload is a field-name position, not

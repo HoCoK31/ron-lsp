@@ -957,6 +957,42 @@ _field of `{}`_",
                 return Ok(Some(CompletionResponse::Array(items)));
             }
 
+            if completion::is_field_name_position(&content, position) {
+                // A field's owner may be an anonymous record
+                // (`projectile: (key: …)`): the annotation contexts cannot name
+                // its type, so ask the tree path for the owner instead.
+                if let Some(found) = completion::field_at_position(
+                    &content,
+                    position,
+                    &type_path,
+                    self.rust_analyzer.clone(),
+                )
+                .await
+                {
+                    let top_name = type_path.rsplit("::").next().unwrap_or(&type_path);
+                    let found_owner_name = found.owner.rsplit("::").next().unwrap_or(&found.owner);
+                    let owner_name = if completion::anonymous_record_field_value(&content, position)
+                        && found_owner_name == top_name
+                    {
+                        // No inner field was typed yet: the path stops at the
+                        // field that owns the anonymous record.
+                        completion::unwrap_wrapper(&found.type_name)
+                    } else {
+                        found.owner.clone()
+                    };
+                    if let Some(owner) = self.rust_analyzer.get_type_info(&owner_name).await {
+                        let items = completion::generate_completions_for_type(
+                            &content,
+                            position,
+                            &owner,
+                            self.rust_analyzer.clone(),
+                        )
+                        .await;
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                }
+            }
+
             // Get type contexts
             let contexts = self.get_type_contexts(&uri, position, &content).await;
 
