@@ -91,9 +91,9 @@ pub(crate) fn is_field_name_position(content: &str, position: Position) -> bool 
     false
 }
 
-/// Whether the cursor is in an anonymous record that is a field value
-/// (`projectile: (key: …, |)`), rather than in a top-level record or a named
-/// struct variant (`Ball(…)`).
+/// Whether the cursor is in an anonymous record that belongs to a field,
+/// possibly through an array (`effects: [(key: …, |)]`), rather than in a
+/// top-level record or a named struct variant (`Ball(…)`).
 ///
 /// Such a record has no type name of its own; its owner is the type of the
 /// enclosing field, so completion must use the field's type instead of walking
@@ -109,19 +109,24 @@ pub(crate) fn anonymous_record_field_value(content: &str, position: Position) ->
         return false;
     };
 
+    let mut record_seen = false;
     let mut current = Some(node);
     while let Some(node) = current {
         match node.kind() {
-            "array" | "map" => return false,
+            "array" | "map" => {
+                if !record_seen {
+                    return false;
+                }
+            }
             "tuple" => {
                 let mut cursor = node.walk();
                 if !node
                     .children(&mut cursor)
                     .any(|child| child.kind() == "field")
+                    && !record_seen
                 {
                     return false;
                 }
-                return node.parent().is_some_and(|parent| parent.kind() == "field");
             }
             "struct" => {
                 let mut cursor = node.walk();
@@ -139,10 +144,13 @@ pub(crate) fn anonymous_record_field_value(content: &str, position: Position) ->
                 if named {
                     return false;
                 }
-                return node.parent().is_some_and(|parent| parent.kind() == "field");
+                record_seen = true;
             }
-            _ => current = node.parent(),
+            "field" => return record_seen,
+            "source_file" => return false,
+            _ => {}
         }
+        current = node.parent();
     }
     false
 }
@@ -1645,6 +1653,26 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["key"]);
         assert_eq!(items[0].insert_text.as_deref(), Some("key: "));
+    }
+
+    /// An anonymous record inside an array is still owned by the array's field:
+    /// `effects: [(key: …, |)]` must complete EffectApplication fields.
+    #[test]
+    fn array_record_is_owned_by_its_field() {
+        let content = "AbilityDef(
+    effects: [
+        (key: \"effect.poisoned\", ),
+    ],
+)";
+        let line = content.lines().nth(2).unwrap();
+        let position = Position::new(2, (line.find(", )").unwrap() + 1) as u32);
+
+        assert!(is_field_name_position(content, position));
+        assert!(anonymous_record_field_value(content, position));
+        assert_eq!(
+            crate::tree_sitter_parser::extract_fields_at_position(content, position),
+            vec!["key".to_string()]
+        );
     }
 
     /// An anonymous record (`projectile: (key: …)`) is a field-name context too:
