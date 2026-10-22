@@ -1321,6 +1321,24 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
     None
 }
 
+/// The first paragraph of a field's doc comment.
+///
+/// Variant hover is a short overview: the full doc lists formula namespaces and
+/// belongs to the field itself, not to the variant summary.
+fn field_doc_summary(docs: &str) -> String {
+    let mut summary = String::new();
+    for line in docs.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(line.trim_end());
+    }
+    summary
+}
+
 impl Backend {
     #[cfg_attr(not(test), allow(dead_code))]
     fn format_ron(content: &str) -> String {
@@ -1341,7 +1359,7 @@ impl Backend {
             variant.name
         );
 
-        if let Some(ref docs) = variant.docs {
+        if let Some(docs) = &variant.docs {
             hover_text.push_str(&format!("\n\n{}", docs));
         }
 
@@ -1349,8 +1367,10 @@ impl Backend {
             hover_text.push_str("\n\n**Fields:**\n");
             for field in &variant.fields {
                 hover_text.push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
-                if let Some(ref field_docs) = field.docs {
-                    hover_text.push_str(&format!(" - {}", field_docs));
+                if let Some(field_docs) = field.docs.as_deref().map(field_doc_summary) {
+                    if !field_docs.is_empty() {
+                        hover_text.push_str(&format!(" - {}", field_docs));
+                    }
                 }
                 hover_text.push('\n');
             }
@@ -1579,6 +1599,16 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variant_field_docs_keep_only_the_summary() {
+        let docs = "Суммарная длина пути в тайлах, включая отражения.\n\nДоступные ссылки:\n\n- `weapon.stat` — статы оружия;";
+        assert_eq!(
+            field_doc_summary(docs),
+            "Суммарная длина пути в тайлах, включая отражения."
+        );
+        assert_eq!(field_doc_summary("Одна строка."), "Одна строка.");
+    }
 
     #[test]
     fn test_get_word_at_position_cyrillic() {
