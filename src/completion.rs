@@ -911,7 +911,12 @@ fn field_name_left_of_cursor(content: &str, offset: usize) -> Option<String> {
     let left = content.get(..offset)?;
     let line = left.rsplit('\n').next()?;
     let trimmed = line.trim_end();
-    let (name, _) = trimmed.rsplit_once(':')?;
+    let (name, rest) = trimmed.rsplit_once(':')?;
+    // Only an empty value position needs the synthetic field step: in
+    // `formula: "1"` the tree already has the formula field and a value.
+    if !rest.trim().is_empty() {
+        return None;
+    }
     let name = name.trim_end();
     let name = name.rsplit(|c: char| c.is_whitespace()).next()?;
 
@@ -1599,6 +1604,24 @@ mod tests {
         );
     }
 
+    /// A formula field inside an array record must not gain a synthetic field
+    /// step from the previous `delivery:` on the same RON line.
+    #[test]
+    fn formula_field_path_has_no_spurious_field() {
+        let content = r#"EffectDef(
+    damage: [(damage_type_key: "damage_type.elemental.poison", delivery: [Dot], formula: "1.0")],
+)"#;
+        let line = content.lines().nth(1).unwrap();
+        let pos = Position::new(1, (line.find("formula").unwrap() + 1) as u32);
+        assert_eq!(
+            path_at_position(content, pos),
+            Some(vec![
+                Step::Field("damage".into()),
+                Step::Field("formula".into()),
+            ])
+        );
+    }
+
     /// A field inside a nested tuple (`projectile: (key: …)`) follows its own
     /// owner, not the outer ability: the path keeps both field steps.
     #[test]
@@ -1933,7 +1956,8 @@ mod tests {
         );
         assert_eq!(
             field_name_left_of_cursor("items: [\n    kind: Va", 20),
-            Some("kind".to_string())
+            None,
+            "a non-empty value is already in the tree"
         );
         // No colon, a name that is not an identifier, nothing before the cursor, or an
         // offset past the end of the text.
