@@ -1528,6 +1528,20 @@ mod tests {
         );
     }
 
+    /// A field inside a nested tuple (`projectile: (key: …)`) follows its own
+    /// owner, not the outer ability: the path keeps both field steps.
+    #[test]
+    fn nested_tuple_field_path_resolves() {
+        let content = "AbilityDef(
+    projectile: (key: \"item.arrow\", consumable: true),
+)";
+        let path = path_at_position(content, Position::new(1, 18)).expect("path to key");
+        assert_eq!(
+            path,
+            vec![Step::Field("projectile".into()), Step::Field("key".into()),]
+        );
+    }
+
     /// The first value of the pair is typed without a comma: there is no tuple in the
     /// tree yet (the parser keeps `( k` in an ERROR), but the position is still read.
     #[test]

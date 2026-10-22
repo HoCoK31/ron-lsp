@@ -746,8 +746,51 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let top_type = type_path.clone();
         if let Some(type_path) = type_path {
+            // Field through the tree first: annotation contexts never descend into
+            // arrays and tuples, so `projectile: (key: …)` would otherwise resolve
+            // the key against the outer `AbilityDef` and show the wrong docs.
+            if let Some(found) = completion::field_at_position(
+                &content,
+                position,
+                &type_path,
+                self.rust_analyzer.clone(),
+            )
+            .await
+            {
+                // The word may be a variant of the field's type: it is offered even
+                // when it sits inside a list or a tuple rule.
+                let field_type = completion::unwrap_wrapper(&found.type_name);
+                if let Some(info) = self.rust_analyzer.get_type_info(&field_type).await {
+                    if let Some(variant) = info.find_variant(&word) {
+                        return Ok(Some(self.variant_hover(&info, variant)));
+                    }
+                }
+
+                if found.name == word {
+                    let owner_name = found.owner.split("::").last().unwrap_or(&found.owner);
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!(
+                                "```rust
+{}: {}
+```
+
+{}
+
+_field of `{}`_",
+                                found.name,
+                                found.type_name,
+                                found.docs.as_deref().unwrap_or(""),
+                                owner_name
+                            ),
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+
             // Use cached context lookup
             let contexts = self.get_type_contexts(&uri, position, &content).await;
 
@@ -871,49 +914,6 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
-            }
-        }
-
-        // Field through the tree: annotation contexts never descend into arrays and
-        // tuples, so a field inside a list of records is not found that way.
-        if let Some(type_path) = top_type.as_deref() {
-            if let Some(found) = completion::field_at_position(
-                &content,
-                position,
-                type_path,
-                self.rust_analyzer.clone(),
-            )
-            .await
-            {
-                // The word may be a variant of the field's type: it is offered even
-                // when it sits inside a list or a tuple rule.
-                let field_type = completion::unwrap_wrapper(&found.type_name);
-                if let Some(info) = self.rust_analyzer.get_type_info(&field_type).await {
-                    if let Some(variant) = info.find_variant(&word) {
-                        return Ok(Some(self.variant_hover(&info, variant)));
-                    }
-                }
-
-                let owner_name = found.owner.split("::").last().unwrap_or(&found.owner);
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: format!(
-                            "```rust
-{}: {}
-```
-
-{}
-
-_field of `{}`_",
-                            found.name,
-                            found.type_name,
-                            found.docs.as_deref().unwrap_or(""),
-                            owner_name
-                        ),
-                    }),
-                    range: None,
-                }));
             }
         }
 
