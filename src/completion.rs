@@ -741,6 +741,15 @@ enum Step {
     Variant { name: String, index: usize },
 }
 
+/// Whether a variant field is positional (`0`, `1`, …) rather than named.
+///
+/// Tuple payloads use positional names; named struct variants (`Dodge(key: …)`)
+/// keep Rust identifiers. The distinction decides whether a `Variant` step
+/// selects a payload value or is only a context for the following field step.
+fn is_tuple_slot_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Whether `ancestor` is an ancestor of `node` (or the node itself).
 fn node_is_ancestor_or_self(ancestor: tree_sitter::Node<'_>, node: tree_sitter::Node<'_>) -> bool {
     let mut current = Some(node);
@@ -793,11 +802,9 @@ fn values_in_open_paren<'t>(
         .filter(|child| child.start_byte() >= open.end_byte())
         .collect();
 
-    // Named fields mean a struct as well, not a tuple.
-    if values.iter().any(|child| child.kind() == "field") {
-        return None;
-    }
-
+    // Named fields are returned too: a named struct variant (`Dodge(key: …)`)
+    // needs its variant step, and the caller ignores named values when the node
+    // has no variant name (a bare record `(key: …)`).
     Some(values)
 }
 
@@ -868,8 +875,19 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
             {
                 // `FirstParentOf([ … ])` names the enum variant in front of the payload.
                 match variant_name(&node, content) {
+                    // `Root(…)` at the document root is the mapped type itself,
+                    // not a variant of it; variants live in arrays and fields.
+                    Some(_)
+                        if node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "source_file") => {}
                     Some(name) => path.push(Step::Variant { name, index }),
-                    None => path.push(Step::Element(index)),
+                    // A bare record `(key: …)` is not a tuple element: its fields
+                    // are named, and the field step already names the one at the cursor.
+                    None if !values.iter().any(|value| value.kind() == "field") => {
+                        path.push(Step::Element(index))
+                    }
+                    None => {}
                 }
             }
         }
@@ -937,6 +955,34 @@ async fn step_type(
     current: &TypeInfo,
     step: &Step,
 ) -> Option<TypeInfo> {
+    // A named struct variant (`Dodge(key: …, evasion: …)`) is a context, not a
+    // value: the following `Field` step names the field inside it. Expose the
+    // variant's own fields as a struct so that step resolves against them.
+    // Tuple payloads (`FirstParentOf([ … ])`) keep the old value semantics.
+    if let Step::Variant { name, index } = step {
+        let base = analyzer
+            .get_type_info(&unwrap_wrapper(&current.name))
+            .await
+            .unwrap_or_else(|| current.clone());
+        if let TypeKind::Enum(variants) = &base.kind {
+            if let Some(variant) = variants.iter().find(|variant| &variant.name == name) {
+                if let Some(field) = variant.fields.get(*index) {
+                    if !is_tuple_slot_name(&field.name) {
+                        return Some(TypeInfo {
+                            name: format!("{}::{}", base.name, variant.name),
+                            kind: TypeKind::Struct(variant.fields.clone()),
+                            docs: variant.docs.clone(),
+                            source_file: base.source_file.clone(),
+                            line: variant.line,
+                            column: variant.column,
+                            has_default: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let type_name = field_type_name(analyzer, current, step).await?;
     analyzer.get_type_info(&unwrap_wrapper(&type_name)).await
 }
@@ -956,13 +1002,9 @@ async fn field_type_name(
         .unwrap_or_else(|| current.clone());
 
     match step {
-        Step::Field(name) => Some(
-            base.fields()?
-                .iter()
-                .find(|field| &field.name == name)?
-                .type_name
-                .clone(),
-        ),
+        // `find_field` also searches the fields of enum variants: a named
+        // struct variant exposes them without a separate type of its own.
+        Step::Field(name) => Some(base.find_field(name)?.type_name.clone()),
         Step::Element(index) => Some(base.fields()?.get(*index)?.type_name.clone()),
         Step::Variant { name, index } => {
             let TypeKind::Enum(variants) = &base.kind else {
@@ -1017,6 +1059,9 @@ fn cursor_inside_string(content: &str, position: Position) -> bool {
 pub(crate) struct FieldAtCursor {
     /// The owning type, by full name.
     pub owner: String,
+    /// The owning type itself: a named struct variant has no resolvable name of
+    /// its own, so callers that need the fields (completion) take them from here.
+    pub owner_type: TypeInfo,
     /// The field name; a tuple position keeps the name the scanner gave it (`0`, `1`).
     pub name: String,
     /// The field type as declared, as a string.
@@ -1066,11 +1111,9 @@ pub(crate) async fn field_at_position(
         .unwrap_or(current);
 
     let field = match last {
-        Step::Field(name) => owner
-            .fields()?
-            .iter()
-            .find(|field| &field.name == name)?
-            .clone(),
+        // `find_field` searches enum variants too: a named struct variant is
+        // exposed as its own field list by `step_type`.
+        Step::Field(name) => owner.find_field(name)?.clone(),
         Step::Element(index) => owner.fields()?.get(*index)?.clone(),
         Step::Variant { name, index } => {
             let TypeKind::Enum(variants) = &owner.kind else {
@@ -1083,6 +1126,7 @@ pub(crate) async fn field_at_position(
 
     Some(FieldAtCursor {
         owner: owner.name.clone(),
+        owner_type: owner,
         name: field.name.clone(),
         type_name: field.type_name.clone(),
         docs: field.docs.clone(),
@@ -2075,12 +2119,14 @@ mod tests {
         let after = ts_utils::position_to_byte_offset(content, Position::new(1, 31));
         assert!(values_in_open_paren(&tuple, after).is_none());
 
-        // A struct in parentheses is not a tuple.
+        // A struct in parentheses is not a tuple: its values are named fields,
+        // returned so a named variant can keep its variant step.
         let mut group = element;
         while group.kind() != "struct" {
             group = group.parent().expect("enclosing struct");
         }
-        assert!(values_in_open_paren(&group, offset).is_none());
+        let named = values_in_open_paren(&group, offset).expect("named fields");
+        assert!(named.iter().all(|value| value.kind() == "field"));
     }
 
     /// Value completions of a field come from the type written in it.
@@ -2177,5 +2223,98 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "Root");
         assert_eq!(items[0].kind, Some(CompletionItemKind::STRUCT));
+    }
+
+    /// A named struct variant's fields are reachable through the tree path:
+    /// `Dodge(…, evasion: …)` names the field directly instead of a payload slot.
+    #[test]
+    fn named_variant_field_path_keeps_the_variant_step() {
+        let content = "[\n    Dodge(key: \"defense.dodge.base\", evasion: \"holder.stat.combat.evasion\"),\n]";
+        let character = content.lines().nth(1).unwrap().find("evasion").unwrap() as u32 + 1;
+        let path = path_at_position(content, Position::new(1, character)).expect("path");
+        assert_eq!(
+            path,
+            vec![
+                Step::Variant {
+                    name: "Dodge".into(),
+                    index: 1,
+                },
+                Step::Field("evasion".into()),
+            ]
+        );
+    }
+
+    /// The step into a named struct variant exposes that variant's fields; the
+    /// following field step resolves against them instead of the enum itself.
+    #[tokio::test]
+    async fn named_variant_step_exposes_its_fields() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let dodge = EnumVariant {
+            name: "Dodge".to_string(),
+            fields: vec![field("key", "String"), field("evasion", "String")],
+            docs: Some("Уворот".to_string()),
+            line: Some(4),
+            column: Some(0),
+        };
+        let top = type_of("crate::models::DefenseDef", TypeKind::Enum(vec![dodge]));
+        analyzer.insert_type_for_test(top.clone()).await;
+
+        let step = Step::Variant {
+            name: "Dodge".into(),
+            index: 1,
+        };
+        let next = step_type(&analyzer, &top, &step)
+            .await
+            .expect("variant type");
+        assert_eq!(next.name, "crate::models::DefenseDef::Dodge");
+        assert_eq!(next.fields().map(Vec::len), Some(2));
+        assert_eq!(
+            field_type_name(&analyzer, &top, &Step::Field("evasion".into()))
+                .await
+                .as_deref(),
+            Some("String")
+        );
+    }
+
+    /// The whole tree path resolves a named variant field, and the returned
+    /// owner carries the variant fields for field-name completion.
+    #[tokio::test]
+    async fn named_variant_field_resolves_through_tree() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let dodge = EnumVariant {
+            name: "Dodge".to_string(),
+            fields: vec![
+                field("key", "String"),
+                FieldInfo {
+                    name: "evasion".to_string(),
+                    type_name: "String".to_string(),
+                    docs: Some("Формула рейтинга уворота".to_string()),
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ],
+            docs: Some("Уворот".to_string()),
+            line: Some(4),
+            column: Some(0),
+        };
+        let top = type_of("crate::models::DefenseDef", TypeKind::Enum(vec![dodge]));
+        analyzer.insert_type_for_test(top).await;
+
+        let content = "[\n    Dodge(key: \"defense.dodge.base\", evasion: \"holder.stat.combat.evasion\"),\n]";
+        let character = content.lines().nth(1).unwrap().find("evasion").unwrap() as u32 + 1;
+        let found = field_at_position(
+            content,
+            Position::new(1, character),
+            "crate::models::DefenseDef",
+            analyzer,
+        )
+        .await
+        .expect("field under cursor");
+
+        assert_eq!(found.name, "evasion");
+        assert_eq!(found.docs.as_deref(), Some("Формула рейтинга уворота"));
+        assert_eq!(found.owner_type.name, "crate::models::DefenseDef::Dodge");
+        assert_eq!(found.owner_type.fields().map(Vec::len), Some(2));
     }
 }

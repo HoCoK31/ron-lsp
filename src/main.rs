@@ -758,6 +758,16 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
+        // The word may name a variant of the document type itself:
+        // `Dodge(…)` at the top level of `defenses.ron`.
+        if let Some(top_path) = type_path.as_deref() {
+            if let Some(top) = self.rust_analyzer.get_type_info(top_path).await {
+                if let Some(variant) = top.find_variant(&word) {
+                    return Ok(Some(self.variant_hover(&top, variant)));
+                }
+            }
+        }
+
         if let Some(type_path) = type_path {
             // Field through the tree first: annotation contexts never descend into
             // arrays and tuples, so `projectile: (key: …)` would otherwise resolve
@@ -983,16 +993,19 @@ _field of `{}`_",
                 {
                     let top_name = type_path.rsplit("::").next().unwrap_or(&type_path);
                     let found_owner_name = found.owner.rsplit("::").next().unwrap_or(&found.owner);
-                    let owner_name = if completion::anonymous_record_field_value(&content, position)
+                    let owner = if completion::anonymous_record_field_value(&content, position)
                         && found_owner_name == top_name
                     {
                         // No inner field was typed yet: the path stops at the
                         // field that owns the anonymous record.
-                        completion::unwrap_wrapper(&found.type_name)
+                        let owner_name = completion::unwrap_wrapper(&found.type_name);
+                        self.rust_analyzer.get_type_info(&owner_name).await
                     } else {
-                        found.owner.clone()
+                        // A named struct variant has no resolvable type of its
+                        // own: the resolver hands over its field list directly.
+                        Some(found.owner_type.clone())
                     };
-                    if let Some(owner) = self.rust_analyzer.get_type_info(&owner_name).await {
+                    if let Some(owner) = owner {
                         let items = completion::generate_completions_for_type(
                             &content,
                             position,
