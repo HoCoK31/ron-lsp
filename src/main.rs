@@ -608,7 +608,7 @@ impl LanguageServer for Backend {
 
                         // Get the type of this field (e.g., PostType)
                         if let Some(field_type_info) =
-                            self.rust_analyzer.get_type_info(&field.type_name).await
+                            completion::field_type_info(&self.rust_analyzer, field).await
                         {
                             self.client
                                 .log_message(
@@ -712,7 +712,7 @@ impl LanguageServer for Backend {
                 if let Some(field) = info.find_field(&field_name) {
                     // Get the type of this specific field
                     if let Some(field_type_info) =
-                        self.rust_analyzer.get_type_info(&field.type_name).await
+                        completion::field_type_info(&self.rust_analyzer, field).await
                     {
                         // Check if word is a variant of this field's type
                         if let Some(variant) = field_type_info.find_variant(&word) {
@@ -893,7 +893,7 @@ _field of `{}`_",
                     if let Some(field) = type_info.find_field(&field_name) {
                         // Get the type of this field
                         if let Some(field_type_info) =
-                            self.rust_analyzer.get_type_info(&field.type_name).await
+                            completion::field_type_info(&self.rust_analyzer, field).await
                         {
                             // Check if word is a variant of this field's type
                             if let Some(variant) = field_type_info.find_variant(&word) {
@@ -1476,7 +1476,7 @@ impl Backend {
                     if let Some(fields) = info.fields() {
                         for field in fields {
                             if let Some(field_type_info) =
-                                self.rust_analyzer.get_type_info(&field.type_name).await
+                                completion::field_type_info(&self.rust_analyzer, field).await
                             {
                                 // Check if this field's type has a variant with the context name
                                 if field_type_info.find_variant(&context.type_name).is_some() {

@@ -1,4 +1,4 @@
-use crate::rust_analyzer::{RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use crate::tree_sitter_parser;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
@@ -726,6 +726,17 @@ pub(crate) fn unwrap_wrapper(type_name: &str) -> String {
             None => return current,
         }
     }
+}
+
+/// Resolves a field's model type, unwrapping containers: `delivery: Vec<Delivery>`
+/// points at `Delivery`, not at a type literally named `Vec<Delivery>`.
+pub(crate) async fn field_type_info(
+    analyzer: &Arc<RustAnalyzer>,
+    field: &FieldInfo,
+) -> Option<TypeInfo> {
+    analyzer
+        .get_type_info(&unwrap_wrapper(&field.type_name))
+        .await
 }
 
 /// One step of the path from the file root down to the cursor.
@@ -2028,6 +2039,25 @@ mod tests {
             unwrap_wrapper("HashMap<String, Kind>"),
             "HashMap<String,Kind>"
         );
+    }
+
+    /// A field declared as `Vec<Delivery>` resolves to `Delivery`: goto
+    /// definition on `delivery: [Melee]` must find the `Melee` variant.
+    #[tokio::test]
+    async fn field_type_info_unwraps_list_elements() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "Delivery",
+                TypeKind::Enum(vec![variant("Melee"), variant("Ranged")]),
+            ))
+            .await;
+
+        let info = field_type_info(&analyzer, &field("delivery", "Vec<Delivery>"))
+            .await
+            .expect("element type");
+        assert_eq!(info.name, "Delivery");
+        assert!(info.find_variant("Melee").is_some());
     }
 
     /// The inner type of a generic is cut out of the text of the type.
