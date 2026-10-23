@@ -35,6 +35,21 @@ pub struct Backend {
     config: Arc<RwLock<Config>>,
 }
 
+/// Config supplied by the client at initialization, if any.
+///
+/// An empty object (and `null`) means "no options": clients such as OMP always
+/// send `initializationOptions: {}`, and honoring it as a real config would
+/// silently skip `ron.toml` and leave every file without a type annotation.
+fn config_from_initialization_options(
+    options: Option<&serde_json::Value>,
+) -> std::result::Result<Option<Config>, serde_json::Error> {
+    match options {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(map)) if map.is_empty() => Ok(None),
+        Some(options) => serde_json::from_value(options.clone()).map(Some),
+    }
+}
+
 impl Backend {
     fn new(client: Client) -> Self {
         Self {
@@ -50,12 +65,9 @@ impl Backend {
         initialization_options: Option<&serde_json::Value>,
         dir: P,
     ) {
-        let c = match initialization_options
-            .map(|options| serde_json::from_value::<Config>(options.clone()))
-        {
-            None => None,
-            Some(Ok(c)) => Some(c),
-            Some(Err(err)) => {
+        let c = match config_from_initialization_options(initialization_options) {
+            Ok(c) => c,
+            Err(err) => {
                 self.client
                     .log_message(
                         MessageType::ERROR,
@@ -1599,6 +1611,33 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_initialization_options_fall_back_to_ron_toml() {
+        assert!(config_from_initialization_options(None).unwrap().is_none());
+        assert!(
+            config_from_initialization_options(Some(&serde_json::json!(null)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            config_from_initialization_options(Some(&serde_json::json!({})))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn initialization_options_override_ron_toml() {
+        let config = config_from_initialization_options(Some(&serde_json::json!({
+            "root_dir": "C:/work",
+            "types": [{"glob": "**/*.ron", "type": "crate::Def"}]
+        })))
+        .unwrap()
+        .expect("client config");
+        assert_eq!(config.root_dir.as_deref(), Some(Path::new("C:/work")));
+        assert!(config.match_module_path("C:/work/defs.ron").is_some());
+    }
 
     #[test]
     fn variant_field_docs_keep_only_the_summary() {
