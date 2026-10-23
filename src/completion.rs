@@ -98,16 +98,16 @@ pub(crate) fn is_field_name_position(content: &str, position: Position) -> bool 
 /// Such a record has no type name of its own; its owner is the type of the
 /// enclosing field, so completion must use the field's type instead of walking
 /// up to the document type.
-pub(crate) fn anonymous_record_field_value(content: &str, position: Position) -> bool {
+///
+/// Returns that enclosing field's name. When the cursor is already on an inner
+/// field (`scope: (delivery: …)`), the name differs from the field under the
+/// cursor and the record's own type stays the owner.
+pub(crate) fn anonymous_record_field_name(content: &str, position: Position) -> Option<String> {
     use crate::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
-    let Some(tree) = parser.parse(content) else {
-        return false;
-    };
-    let Some(node) = ts_utils::node_at_position(&tree, content, position) else {
-        return false;
-    };
+    let tree = parser.parse(content)?;
+    let node = ts_utils::node_at_position(&tree, content, position)?;
 
     let mut record_seen = false;
     let mut current = Some(node);
@@ -115,17 +115,20 @@ pub(crate) fn anonymous_record_field_value(content: &str, position: Position) ->
         match node.kind() {
             "array" | "map" => {
                 if !record_seen {
-                    return false;
+                    return None;
                 }
             }
             "tuple" => {
                 let mut cursor = node.walk();
-                if !node
+                let has_field = node
                     .children(&mut cursor)
-                    .any(|child| child.kind() == "field")
-                    && !record_seen
-                {
-                    return false;
+                    .any(|child| child.kind() == "field");
+                // `scope: ()` is an empty record, not a positional tuple: name
+                // the enclosing field so its type can provide the fields.
+                if node.named_child_count() == 0 {
+                    record_seen = true;
+                } else if !has_field && !record_seen {
+                    return None;
                 }
             }
             "struct" => {
@@ -134,7 +137,7 @@ pub(crate) fn anonymous_record_field_value(content: &str, position: Position) ->
                     .children(&mut cursor)
                     .any(|child| child.kind() == "field")
                 {
-                    return false;
+                    return None;
                 }
                 // A named struct (`Ball(…)`) is an enum variant, not a bare
                 // record: its first child is the identifier.
@@ -142,17 +145,23 @@ pub(crate) fn anonymous_record_field_value(content: &str, position: Position) ->
                     .named_child(0)
                     .is_some_and(|child| child.kind() == "identifier");
                 if named {
-                    return false;
+                    return None;
                 }
                 record_seen = true;
             }
-            "field" => return record_seen,
-            "source_file" => return false,
+            "field" => {
+                // The first field is the one under the cursor (or its value):
+                // skip it and keep walking to the record that contains it.
+                if record_seen {
+                    return ts_utils::field_name(&node, content).map(str::to_string);
+                }
+            }
+            "source_file" => return None,
             _ => {}
         }
         current = node.parent();
     }
-    false
+    None
 }
 
 /// Determine what we're completing based on cursor position using tree-sitter
@@ -1746,10 +1755,29 @@ mod tests {
         let position = Position::new(2, (line.find(", )").unwrap() + 1) as u32);
 
         assert!(is_field_name_position(content, position));
-        assert!(anonymous_record_field_value(content, position));
+        assert!(anonymous_record_field_name(content, position).is_some());
         assert_eq!(
             crate::tree_sitter_parser::extract_fields_at_position(content, position),
             vec!["key".to_string()]
+        );
+    }
+
+    /// A record nested under a field names that field as its owner, whether the
+    /// cursor is on an inner field or in an empty record.
+    #[test]
+    fn nested_record_owner_is_the_field_holding_it() {
+        let content = "DefenseDef(
+    Block(
+        scope: (
+            delivery: [Melee],
+        ),
+    ),
+)";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, line.find("delivery").unwrap() as u32 + 1);
+        assert_eq!(
+            anonymous_record_field_name(content, position).as_deref(),
+            Some("scope")
         );
     }
 
@@ -1769,7 +1797,7 @@ mod tests {
         let position = Position::new(1, (line.find(", )").unwrap() + 1) as u32);
 
         assert!(is_field_name_position(content, position));
-        assert!(anonymous_record_field_value(content, position));
+        assert!(anonymous_record_field_name(content, position).is_some());
         assert_eq!(
             get_completion_context(content, position),
             CompletionContext::FieldName
