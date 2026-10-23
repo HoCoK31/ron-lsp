@@ -2347,4 +2347,73 @@ mod tests {
         assert_eq!(found.owner_type.name, "crate::models::DefenseDef::Dodge");
         assert_eq!(found.owner_type.fields().map(Vec::len), Some(2));
     }
+
+    /// A record inside `damage: [ ( … ) ]` belongs to the element type:
+    /// its fields resolve to `DamageEntry`, not to the document type.
+    #[tokio::test]
+    async fn nested_record_fields_resolve_through_the_list_field() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of("Delivery", TypeKind::Enum(vec![variant("Melee")])))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "DamageEntry",
+                TypeKind::Struct(vec![
+                    field("damage_type_key", "String"),
+                    field("delivery", "Vec<Delivery>"),
+                    field("formula", "String"),
+                ]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "AbilityDef",
+                TypeKind::Struct(vec![
+                    field("key", "String"),
+                    field("damage", "Vec<DamageEntry>"),
+                ]),
+            ))
+            .await;
+
+        let content = "[\n    (\n        damage: [\n            (\n                damage_type_key: \"damage_type.physic.pierce\",\n                delivery: [Melee],\n                formula: \"1\",\n            ),\n        ],\n    ),\n]";
+        let line_of = |needle: &str| {
+            content
+                .lines()
+                .position(|line| line.contains(needle))
+                .unwrap() as u32
+        };
+        let char_of = |needle: &str| {
+            content
+                .lines()
+                .nth(line_of(needle) as usize)
+                .unwrap()
+                .find(needle)
+                .unwrap() as u32
+                + 1
+        };
+
+        let field = field_at_position(
+            content,
+            Position::new(line_of("damage_type_key"), char_of("damage_type_key")),
+            "AbilityDef",
+            analyzer.clone(),
+        )
+        .await
+        .expect("damage_type_key field");
+        assert_eq!(field.name, "damage_type_key");
+        assert_eq!(field.owner_type.name, "DamageEntry");
+
+        let delivery = field_at_position(
+            content,
+            Position::new(line_of("delivery"), char_of("delivery")),
+            "AbilityDef",
+            analyzer,
+        )
+        .await
+        .expect("delivery field");
+        assert_eq!(delivery.name, "delivery");
+        assert_eq!(delivery.owner_type.name, "DamageEntry");
+        assert_eq!(delivery.type_name, "Vec<Delivery>");
+    }
 }

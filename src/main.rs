@@ -504,6 +504,43 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format!("Word at position: {}", word))
             .await;
 
+        // The tree path knows about nested records (`damage: [ (formula: …) ]`)
+        // that annotation contexts cannot name. Resolve the field through it
+        // before falling back to the annotated type.
+        if let Some(type_path) = type_path.as_deref() {
+            if let Some(found) = completion::field_at_position(
+                &content,
+                position,
+                type_path,
+                self.rust_analyzer.clone(),
+            )
+            .await
+            {
+                // Cursor on a field name: go to its declaration.
+                if found.name == word {
+                    if let Some(field) = found.owner_type.find_field(&word) {
+                        return create_location_response(
+                            &found.owner_type.source_file,
+                            field.line,
+                            field.column,
+                        );
+                    }
+                }
+
+                // Cursor on a value: the word may be a variant of the field type.
+                let field_type = completion::unwrap_wrapper(&found.type_name);
+                if let Some(field_type_info) = self.rust_analyzer.get_type_info(&field_type).await {
+                    if let Some(variant) = field_type_info.find_variant(&word) {
+                        return create_location_response(
+                            &field_type_info.source_file,
+                            variant.line,
+                            variant.column,
+                        );
+                    }
+                }
+            }
+        }
+
         // If we have a type annotation, find the nested context
         let current_type_info = if let Some(type_path) = type_path {
             self.client
