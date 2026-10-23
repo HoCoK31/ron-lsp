@@ -504,6 +504,20 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format!("Word at position: {}", word))
             .await;
 
+        // The word may name a variant of the document type itself:
+        // `Dodge(…)` at the top level of `defenses.ron`.
+        if let Some(top_path) = type_path.as_deref() {
+            if let Some(top) = self.rust_analyzer.get_type_info(top_path).await {
+                if let Some(variant) = top.find_variant(&word) {
+                    return create_location_response(
+                        &top.source_file,
+                        variant.line,
+                        variant.column,
+                    );
+                }
+            }
+        }
+
         // The tree path knows about nested records (`damage: [ (formula: …) ]`)
         // that annotation contexts cannot name. Resolve the field through it
         // before falling back to the annotated type.
