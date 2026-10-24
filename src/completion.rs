@@ -1,4 +1,4 @@
-use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use crate::tree_sitter_parser;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
@@ -759,6 +759,10 @@ enum Step {
     /// A value of an enum variant: `FirstParentOf([Filter])` — the identifier names
     /// the variant and the payload values are its fields, "0", "1", ….
     Variant { name: String, index: usize },
+    /// The field list of a named struct variant beyond its last field:
+    /// `MeleeSimple(range: "…", |)` — the field being typed has no value yet, so
+    /// no `Variant` slot names it. The variant's payload is the owner of the list.
+    VariantFields { name: String },
 }
 
 /// Whether a variant field is positional (`0`, `1`, …) rather than named.
@@ -768,6 +772,34 @@ enum Step {
 /// selects a payload value or is only a context for the following field step.
 fn is_tuple_slot_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A named struct variant's payload as a struct.
+///
+/// RON writes the payload as fields (`MeleeSimple(range: …)`), while Rust keeps
+/// it as a variant that has no type name of its own. Callers that need the list
+/// (completion, step resolution) take it as this synthetic struct.
+fn struct_variant_type(base: &TypeInfo, variant: &EnumVariant) -> TypeInfo {
+    TypeInfo {
+        name: format!("{}::{}", base.name, variant.name),
+        kind: TypeKind::Struct(variant.fields.clone()),
+        docs: variant.docs.clone(),
+        source_file: base.source_file.clone(),
+        line: variant.line,
+        column: variant.column,
+        has_default: false,
+    }
+}
+
+/// Whether the variant's payload is a named field list rather than a tuple.
+///
+/// Tuple payloads name their fields "0", "1", …; only named payloads give a
+/// meaning to a field-name position inside them.
+fn is_named_struct_variant(variant: &EnumVariant) -> bool {
+    variant
+        .fields
+        .first()
+        .is_some_and(|field| !is_tuple_slot_name(&field.name))
 }
 
 /// Whether `ancestor` is an ancestor of `node` (or the node itself).
@@ -909,6 +941,24 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
                     }
                     None => {}
                 }
+            } else if values.iter().any(|value| value.kind() == "field")
+                && content
+                    .get(..offset)
+                    .unwrap_or_default()
+                    .trim_end()
+                    .ends_with(',')
+            {
+                // The cursor is past the last field of a named struct variant
+                // (`MeleeSimple(range: "…", |)`): the field being typed has no
+                // value node yet, so the variant itself owns the field list.
+                if let Some(name) = variant_name(&node, content) {
+                    if !node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "source_file")
+                    {
+                        path.push(Step::VariantFields { name });
+                    }
+                }
             }
         }
 
@@ -979,26 +1029,30 @@ async fn step_type(
     // value: the following `Field` step names the field inside it. Expose the
     // variant's own fields as a struct so that step resolves against them.
     // Tuple payloads (`FirstParentOf([ … ])`) keep the old value semantics.
-    if let Step::Variant { name, index } = step {
+    if let Step::Variant { .. } | Step::VariantFields { .. } = step {
         let base = analyzer
             .get_type_info(&unwrap_wrapper(&current.name))
             .await
             .unwrap_or_else(|| current.clone());
         if let TypeKind::Enum(variants) = &base.kind {
-            if let Some(variant) = variants.iter().find(|variant| &variant.name == name) {
-                if let Some(field) = variant.fields.get(*index) {
-                    if !is_tuple_slot_name(&field.name) {
-                        return Some(TypeInfo {
-                            name: format!("{}::{}", base.name, variant.name),
-                            kind: TypeKind::Struct(variant.fields.clone()),
-                            docs: variant.docs.clone(),
-                            source_file: base.source_file.clone(),
-                            line: variant.line,
-                            column: variant.column,
-                            has_default: false,
-                        });
-                    }
-                }
+            let variant = match step {
+                Step::Variant { name, index } => variants
+                    .iter()
+                    .find(|variant| &variant.name == name)
+                    .filter(|variant| {
+                        variant
+                            .fields
+                            .get(*index)
+                            .is_some_and(|field| !is_tuple_slot_name(&field.name))
+                    }),
+                Step::VariantFields { name } => variants
+                    .iter()
+                    .find(|variant| &variant.name == name)
+                    .filter(|variant| is_named_struct_variant(variant)),
+                _ => None,
+            };
+            if let Some(variant) = variant {
+                return Some(struct_variant_type(&base, variant));
             }
         }
     }
@@ -1033,6 +1087,8 @@ async fn field_type_name(
             let variant = variants.iter().find(|variant| &variant.name == name)?;
             Some(variant.fields.get(*index)?.type_name.clone())
         }
+        // A field list has no single type: only `step_type` gives it shape.
+        Step::VariantFields { .. } => None,
     }
 }
 
@@ -1141,6 +1197,25 @@ pub(crate) async fn field_at_position(
             };
             let variant = variants.iter().find(|variant| &variant.name == name)?;
             variant.fields.get(*index)?.clone()
+        }
+        // The cursor is in a named struct variant's field list but after its
+        // last field: there is no value to name, so the variant owns the list.
+        Step::VariantFields { name } => {
+            let TypeKind::Enum(variants) = &owner.kind else {
+                return None;
+            };
+            let variant = variants.iter().find(|variant| &variant.name == name)?;
+            if !is_named_struct_variant(variant) {
+                return None;
+            }
+            let owner_type = struct_variant_type(&owner, variant);
+            return Some(FieldAtCursor {
+                owner: owner_type.name.clone(),
+                owner_type,
+                name: String::new(),
+                type_name: String::new(),
+                docs: variant.docs.clone(),
+            });
         }
     };
 
@@ -1851,6 +1926,56 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["blast_speed"]);
         assert_eq!(items[0].insert_text.as_deref(), Some("blast_speed: "));
+    }
+
+    /// A trailing comma inside a named struct variant's payload belongs to the
+    /// variant, not to the field that holds it: `MeleeSimple`'s own fields are
+    /// completed, not the `AbilityDef` fields around `shape`.
+    #[tokio::test]
+    async fn named_variant_payload_after_comma_offers_its_own_fields() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "AbilityDef",
+                TypeKind::Struct(vec![field("key", "String"), field("shape", "Shape")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "Shape",
+                TypeKind::Enum(vec![EnumVariant {
+                    name: "MeleeSimple".to_string(),
+                    fields: vec![field("range", "String"), field("min_windup", "String")],
+                    docs: None,
+                    line: None,
+                    column: None,
+                }]),
+            ))
+            .await;
+
+        let content = "[\n    (\n        key: \"ability.sting\",\n        shape: MeleeSimple(range: \"stat.combat.reach\", ),\n    ),\n]";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(3, (line.find(", )").unwrap() + 1) as u32);
+
+        assert_eq!(
+            path_at_position(content, position),
+            Some(vec![
+                Step::Field("shape".into()),
+                Step::VariantFields {
+                    name: "MeleeSimple".into()
+                },
+            ])
+        );
+
+        let found = field_at_position(content, position, "AbilityDef", analyzer.clone())
+            .await
+            .expect("owner of the field list");
+        assert_eq!(found.owner_type.name, "Shape::MeleeSimple");
+
+        let items =
+            generate_completions_for_type(content, position, &found.owner_type, analyzer).await;
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["min_windup"]);
     }
 
     /// The cursor context: a type in the value position, a value, or a field name.
