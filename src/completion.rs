@@ -81,9 +81,19 @@ pub(crate) fn is_field_name_position(content: &str, position: Position) -> bool 
             }
             "struct" => {
                 let mut cursor = node.walk();
-                return node
+                if node
                     .children(&mut cursor)
-                    .any(|child| child.kind() == "field");
+                    .any(|child| child.kind() == "field")
+                {
+                    return true;
+                }
+                // A payload with no field yet (`MeleeSimple(|)`) looks like a
+                // tuple to the tree; the variant name in front of the paren is
+                // the only signal. A tuple payload is rejected later, when the
+                // variant is resolved against its Rust type.
+                return node
+                    .named_child(0)
+                    .is_some_and(|child| child.kind() == "identifier");
             }
             _ => current = node.parent(),
         }
@@ -941,22 +951,24 @@ fn path_at_position(content: &str, position: Position) -> Option<Vec<Step>> {
                     }
                     None => {}
                 }
-            } else if values.iter().any(|value| value.kind() == "field")
-                && content
-                    .get(..offset)
-                    .unwrap_or_default()
-                    .trim_end()
-                    .ends_with(',')
-            {
-                // The cursor is past the last field of a named struct variant
-                // (`MeleeSimple(range: "…", |)`): the field being typed has no
-                // value node yet, so the variant itself owns the field list.
-                if let Some(name) = variant_name(&node, content) {
-                    if !node
-                        .parent()
-                        .is_some_and(|parent| parent.kind() == "source_file")
-                    {
-                        path.push(Step::VariantFields { name });
+            } else {
+                let before = content.get(..offset).unwrap_or_default().trim_end();
+                let starts_field_list = (values.is_empty() && before.ends_with('('))
+                    || (values.iter().any(|value| value.kind() == "field")
+                        && before.ends_with(','));
+                if starts_field_list {
+                    // The cursor is in a named struct variant's field list but
+                    // not on a value: `MeleeSimple(|)` (nothing typed yet) or
+                    // `MeleeSimple(range: "…", |)` (past the last field). The
+                    // variant itself owns the list; a tuple payload is rejected
+                    // when the variant kind is resolved.
+                    if let Some(name) = variant_name(&node, content) {
+                        if !node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "source_file")
+                        {
+                            path.push(Step::VariantFields { name });
+                        }
                     }
                 }
             }
@@ -1976,6 +1988,97 @@ mod tests {
             generate_completions_for_type(content, position, &found.owner_type, analyzer).await;
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["min_windup"]);
+    }
+
+    /// An empty named struct variant payload (`MeleeSimple(|)`) already sits in
+    /// the variant's field list: its fields are offered before anything is typed.
+    #[tokio::test]
+    async fn named_variant_empty_payload_offers_its_own_fields() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "AbilityDef",
+                TypeKind::Struct(vec![field("key", "String"), field("shape", "Shape")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "Shape",
+                TypeKind::Enum(vec![EnumVariant {
+                    name: "MeleeSimple".to_string(),
+                    fields: vec![field("range", "String"), field("min_windup", "String")],
+                    docs: None,
+                    line: None,
+                    column: None,
+                }]),
+            ))
+            .await;
+
+        let content =
+            "[\n    (\n        key: \"ability.sting\",\n        shape: MeleeSimple(),\n    ),\n]";
+        let line = content.lines().nth(3).unwrap();
+        let position = Position::new(
+            3,
+            (line.find("MeleeSimple(").unwrap() + "MeleeSimple(".len()) as u32,
+        );
+
+        assert!(is_field_name_position(content, position));
+        assert_eq!(
+            path_at_position(content, position),
+            Some(vec![
+                Step::Field("shape".into()),
+                Step::VariantFields {
+                    name: "MeleeSimple".into()
+                },
+            ])
+        );
+
+        let found = field_at_position(content, position, "AbilityDef", analyzer.clone())
+            .await
+            .expect("owner of the field list");
+        assert_eq!(found.owner_type.name, "Shape::MeleeSimple");
+
+        let items =
+            generate_completions_for_type(content, position, &found.owner_type, analyzer).await;
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, vec!["range", "min_windup"]);
+    }
+
+    /// An empty tuple variant payload (`FirstParentOf(|)`) reaches the variant
+    /// through the tree but has no named field list to complete.
+    #[tokio::test]
+    async fn empty_tuple_variant_payload_has_no_field_list() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        analyzer
+            .insert_type_for_test(type_of(
+                "Root",
+                TypeKind::Struct(vec![field("apply_rule", "ApplyRule")]),
+            ))
+            .await;
+        analyzer
+            .insert_type_for_test(type_of(
+                "ApplyRule",
+                TypeKind::Enum(vec![EnumVariant {
+                    name: "FirstParentOf".to_string(),
+                    fields: vec![field("0", "Vec<Species>")],
+                    docs: None,
+                    line: None,
+                    column: None,
+                }]),
+            ))
+            .await;
+
+        let content = "Root(\n    apply_rule: FirstParentOf(),\n)";
+        let line = content.lines().nth(1).unwrap();
+        let position = Position::new(
+            1,
+            (line.find("FirstParentOf(").unwrap() + "FirstParentOf(".len()) as u32,
+        );
+
+        assert!(is_field_name_position(content, position));
+        assert!(field_at_position(content, position, "Root", analyzer)
+            .await
+            .is_none());
     }
 
     /// The cursor context: a type in the value position, a value, or a field name.
